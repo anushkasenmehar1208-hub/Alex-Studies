@@ -216,3 +216,14 @@ next-app/.env.development.local
 # Re-include it so Next.js helper modules are tracked.
 !next-app/src/lib/
 !next-app/src/lib/**
+
+# ---------------------------------------------------------------------------
+# Local dev / tooling noise (production deployment prep)
+# gitignore does not untrack files already committed — tracked .DS_Store
+# copies remain tracked until explicitly removed (not part of this step).
+# ---------------------------------------------------------------------------
+.venv_new/
+.freebuff/
+.claude/
+.DS_Store
+uploaded_files/

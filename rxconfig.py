@@ -40,11 +40,16 @@ def _resolve_public_url() -> str:
     return os.getenv("APP_BASE_URL", PUBLIC_SITE_URL).rstrip("/")
 
 def _resolve_api_url() -> str:
-    # Prefer Reflex-specific config when present, otherwise fall back to the generic API host.
-    # In dev mode (no env vars set), use localhost so the websocket connects locally.
+    # In production with Next.js proxy (Vercel → Render), the browser connects to
+    # the frontend domain (alexstudies.com) for both WebSocket (/event) and API calls.
+    # The Next.js middleware proxies these to the Reflex backend.
+    # If REFLEX_API_URL is explicitly set, use it (for direct backend access).
+    # Otherwise, default to the public frontend URL so the compiled frontend
+    # connects to the correct origin.
     return (
         os.getenv("REFLEX_API_URL")
         or os.getenv("API_URL")
+        or _resolve_public_url()
         or "http://localhost:8000"
     ).rstrip("/")
 

@@ -6,9 +6,15 @@ const REFLEX_BACKEND_URL =
 // Paths owned by Next.js — everything else proxies to Reflex.
 const NEXT_PATHS = [
   "/",
+  "/select",
   "/login",
   "/register",
   "/onboarding",
+  "/generate-plan",
+  "/exam-forecast",
+  "/learn-with-youtube",
+  "/robots.txt",
+  "/sitemap.xml",
 ];
 
 const NEXT_PREFIXES = [
@@ -20,6 +26,15 @@ const NEXT_PREFIXES = [
 function isNextPath(pathname: string): boolean {
   if (NEXT_PATHS.includes(pathname)) return true;
   return NEXT_PREFIXES.some((p) => pathname.startsWith(p));
+}
+
+function normalizeOrigin(origin: string): string {
+  try {
+    const url = new URL(origin);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return origin;
+  }
 }
 
 export async function middleware(req: NextRequest) {
@@ -120,14 +135,16 @@ export async function middleware(req: NextRequest) {
   resHeaders.delete("transfer-encoding");
 
   // Reflex generates Location headers using the request Host, which is
-  // backend.alexstudies.com under our proxy. Rewrite to the original
-  // request origin so redirects stay on alexstudies.com. Edge runtime
-  // rejects relative Locations, so we keep the URL absolute.
+  // the backend URL under our proxy. Rewrite to the original request
+  // origin so redirects stay on alexstudies.com. Edge runtime rejects
+  // relative Locations, so we keep the URL absolute.
   const loc = resHeaders.get("location");
   if (loc) {
-    const requestOrigin = req.nextUrl.origin;
+    const requestOrigin = normalizeOrigin(req.nextUrl.origin);
+    const backendOrigin = normalizeOrigin(REFLEX_BACKEND_URL);
+    // Rewrite any redirect pointing to the backend origin to the frontend origin.
     const rewritten = loc.replace(
-      /^https?:\/\/backend\.alexstudies\.com/i,
+      new RegExp(`^${backendOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
       requestOrigin
     );
     if (rewritten !== loc) resHeaders.set("location", rewritten);

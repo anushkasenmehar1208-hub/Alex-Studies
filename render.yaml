@@ -1,0 +1,73 @@
+# =============================================================================
+# Alex Studies — Render Deployment Configuration
+# =============================================================================
+# This file configures the Render Web Service for the Reflex backend.
+# Render can auto-detect this file if placed at repository root.
+#
+# To deploy:
+# 1. Connect GitHub repo to Render
+# 2. Create new Web Service → "Build and deploy from a Git repository"
+# 3. Render will detect this render.yaml and use it
+# 4. Add environment variables in Render dashboard (see .env.example)
+
+services:
+  - type: web
+    name: alex-studies-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: oregon  # or your preferred region
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: APP_BASE_URL
+        value: https://alexstudies.com
+      - key: REFLEX_API_URL
+        value: https://alexstudies.com
+      - key: DATABASE_URL
+        fromDatabase:
+          name: alex-studies-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: CSRF_COOKIE_SECURE
+        value: "true"
+      - key: ENFORCE_HTTPS
+        value: "true"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://alexstudies.com/auth/google/callback
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: FISH_AUDIO_API_KEY
+        sync: false
+      - key: SUPADATA_API_KEY
+        sync: false
+      - key: DODO_PAYMENTS_API_KEY
+        sync: false
+      - key: DODO_PAYMENTS_PRODUCT_ID
+        sync: false
+      - key: DODO_PAYMENTS_MAX_PRODUCT_ID
+        sync: false
+      - key: DODO_PAYMENTS_ULTRA_PRODUCT_ID
+        sync: false
+      - key: DODO_PAYMENTS_WEBHOOK_SECRET
+        sync: false
+      - key: DODO_PAYMENTS_RETURN_URL
+        value: https://alexstudies.com/app
+      - key: DODO_PAYMENTS_FAILURE_URL
+        value: https://alexstudies.com/pricing
+      - key: ALEX_VIDEO_SERVICE_URL
+        value: https://alex-video-service.onrender.com
+
+databases:
+  - name: alex-studies-db
+    plan: free
+    region: oregon
+    postgresMajorVersion: 16
