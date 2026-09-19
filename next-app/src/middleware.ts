@@ -118,6 +118,11 @@ export async function middleware(req: NextRequest) {
   const headers = new Headers(req.headers);
   headers.delete("host");
   headers.delete("content-length");
+  // Forward cookies to the Reflex backend so auth sessions work
+  const cookieHeader = req.cookies.toString();
+  if (cookieHeader) {
+    headers.set("cookie", cookieHeader);
+  }
 
   const upstreamRes = await fetch(upstream, {
     method: req.method,
