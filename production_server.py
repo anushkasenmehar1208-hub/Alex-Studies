@@ -11,7 +11,7 @@ The frontend is pre-compiled during Docker build via:
 This script:
 1. Creates .web/nocompile marker file (the standard Reflex way to skip compilation)
 2. Sets REFLEX_WEB_WORKDIR to point to pre-compiled frontend
-3. Sets REFLEX_ENV_MODE=PROD
+3. Sets REFLEX_ENV_MODE=prod
 4. Sets __REFLEX_SKIP_COMPILE=true and __REFLEX_MOUNT_FRONTEND_COMPILED_APP=true
 5. Imports the app module and gets the full ASGI app (app())
 6. Runs the ASGI app with Uvicorn on 0.0.0.0:$PORT
@@ -29,7 +29,7 @@ WEB_DIR = Path("/app/.web") if IN_DOCKER else Path("/tmp/test_web")
 # Internal env var names have __ prefix
 os.environ.setdefault("__REFLEX_SKIP_COMPILE", "true")
 os.environ.setdefault("REFLEX_WEB_WORKDIR", str(WEB_DIR))
-os.environ.setdefault("REFLEX_ENV_MODE", "PROD")
+os.environ.setdefault("REFLEX_ENV_MODE", "prod")
 os.environ.setdefault("__REFLEX_MOUNT_FRONTEND_COMPILED_APP", "true")
 
 # Ensure the nocompile marker exists (standard Reflex way to skip compilation)
