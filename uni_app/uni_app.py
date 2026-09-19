@@ -36732,21 +36732,19 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Content Security Policy — allows YouTube iframes + our own assets
         h.setdefault(
             "Content-Security-Policy",
-            (
-                "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
-                "  https://www.googletagmanager.com https://www.google-analytics.com "
-                "  https://www.youtube.com https://s.ytimg.com "
-                "  https://unpkg.com https://cdn.jsdelivr.net; "
-                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-                "font-src 'self' https://fonts.gstatic.com; "
-                "img-src 'self' data: blob: https: http:; "
-                "media-src 'self' blob:; "
-                "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
-                "connect-src 'self' wss: ws: https:; "
-                "worker-src 'self' blob:; "
-                "wasm-src 'self' https://unpkg.com https://cdn.jsdelivr.net; "
-            ),
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
+            "https://www.googletagmanager.com https://www.google-analytics.com "
+            "https://www.youtube.com https://s.ytimg.com "
+            "https://unpkg.com https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: blob: https: http:; "
+            "media-src 'self' blob:; "
+            "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
+            "connect-src 'self' wss: ws: https:; "
+            "worker-src 'self' blob:; "
+            "wasm-src 'self' https://unpkg.com https://cdn.jsdelivr.net;",
         )
         return response
 
