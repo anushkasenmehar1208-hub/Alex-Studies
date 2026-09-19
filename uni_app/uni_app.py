@@ -33257,7 +33257,7 @@ td.group{-webkit-touch-callout:none;user-select:none;}
                 rx.icon_button(
                     rx.icon(tag="arrow_left", size=16),
                     on_click=rx.call_script(
-                        "if (window.history.length > 1) { window.history.back(); } else { window.location.assign('/app'); }"
+                        "if (window.history.length > 1) { window.history.back(); } else { window.location.assign('/s/home'); }"
                     ),
                     variant="ghost", size="2",
                     color="rgba(255,255,255,0.45)",

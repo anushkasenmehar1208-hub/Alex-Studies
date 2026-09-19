@@ -46,11 +46,10 @@ export default function LoginPage() {
         try {
           localStorage.setItem(data.tokenKey, JSON.stringify(data.token));
         } catch {}
-        // Reflex's /app handles onboarding (selecting degree/semester)
-        // for new users and routes already-onboarded users to their
-        // semester. Skipping the Next.js /onboarding avoids the
-        // dropped-context bug where the chat didn't know the degree.
-        window.location.href = "/app";
+        // Reflex uses scope-based routing. The authenticated landing route
+        // is /s/home (home scope) which handles onboarding for new users
+        // and routes already-onboarded users to their semester.
+        window.location.href = "/s/home";
       } else {
         setError(data.error || "Invalid username or password.");
       }

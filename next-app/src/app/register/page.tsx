@@ -58,9 +58,9 @@ export default function RegisterPage() {
         try {
           localStorage.setItem(data.tokenKey, JSON.stringify(data.token));
         } catch {}
-        // Skip Next.js /onboarding — Reflex's /app handles the
+        // Skip Next.js /onboarding — Reflex's /s/home handles the
         // country/degree/semester picker and binds it to the chat.
-        window.location.href = "/app";
+        window.location.href = "/s/home";
       } else {
         setError(data.error || "Couldn't create your account. Try again.");
       }
