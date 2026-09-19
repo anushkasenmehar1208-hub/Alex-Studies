@@ -31,7 +31,8 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p "$REFLEX_DIR" /app/.data
+RUN mkdir -p "$REFLEX_DIR" /app/.data \
+    && reflex export --frontend-only --no-zip --env prod
 
 RUN chmod +x start.sh
 
