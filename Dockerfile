@@ -32,7 +32,10 @@ RUN pip install -r requirements.txt
 COPY . .
 
 RUN mkdir -p "$REFLEX_DIR" /app/.data \
-    && reflex export --frontend-only --no-zip --env prod
+    && reflex export --frontend-only --no-zip --env prod \
+    && mkdir -p .web/backend \
+    && echo '[]' > .web/backend/stateful_pages.json \
+    && echo 'false' > .web/backend/upload_is_used
 
 RUN chmod +x start.sh
 
