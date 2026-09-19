@@ -12,8 +12,9 @@ This script:
 1. Creates .web/nocompile marker file (the standard Reflex way to skip compilation)
 2. Sets REFLEX_WEB_WORKDIR to point to pre-compiled frontend
 3. Sets REFLEX_ENV_MODE=PROD
-4. Imports the app module and gets the ASGI app (app._api)
-5. Runs the ASGI app with Uvicorn on 0.0.0.0:$PORT
+4. Sets __REFLEX_SKIP_COMPILE=true and __REFLEX_MOUNT_FRONTEND_COMPILED_APP=true
+5. Imports the app module and gets the full ASGI app (app())
+6. Runs the ASGI app with Uvicorn on 0.0.0.0:$PORT
 """
 
 import os
@@ -25,8 +26,11 @@ IN_DOCKER = Path("/app").exists()
 WEB_DIR = Path("/app/.web") if IN_DOCKER else Path("/tmp/test_web")
 
 # Must be set BEFORE importing reflex or the app module
+# Internal env var names have __ prefix
+os.environ.setdefault("__REFLEX_SKIP_COMPILE", "true")
 os.environ.setdefault("REFLEX_WEB_WORKDIR", str(WEB_DIR))
 os.environ.setdefault("REFLEX_ENV_MODE", "PROD")
+os.environ.setdefault("__REFLEX_MOUNT_FRONTEND_COMPILED_APP", "true")
 
 # Ensure the nocompile marker exists (standard Reflex way to skip compilation)
 nocompile_path = WEB_DIR / "nocompile"
@@ -41,7 +45,7 @@ backend_dir.mkdir(parents=True, exist_ok=True)
 
 # Now import the app - compilation should be skipped due to nocompile file
 import uvicorn
-from uni_app.uni_app import api as asgi_app
+from uni_app.uni_app import app
 
 
 def main():
@@ -51,6 +55,10 @@ def main():
     print(f"Frontend: {WEB_DIR / 'build/client'}")
     print(f"Database: {'configured' if os.environ.get('DATABASE_URL') else 'NOT SET'}")
     print(f"Starting Uvicorn...")
+    
+    # Get the full ASGI app (calls app.__call__ which handles frontend mounting, middleware, etc.)
+    # The nocompile file + __REFLEX_SKIP_COMPILE prevent full compilation at runtime
+    asgi_app = app()
     
     # Run with Uvicorn
     uvicorn.run(
