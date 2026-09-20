@@ -49,7 +49,7 @@ def _resolve_api_url() -> str:
     return (
         os.getenv("REFLEX_API_URL")
         or os.getenv("API_URL")
-        or _resolve_public_url()
+        or "https://backend.alexstudies.com"
         or "http://localhost:8000"
     ).rstrip("/")
 
