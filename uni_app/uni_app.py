@@ -16540,7 +16540,7 @@ Behavior rules:
                 f"try {{ localStorage.removeItem({json.dumps(AUTH_TOKEN_LOCAL_STORAGE_KEY)}); document.cookie = {json.dumps(AUTH_TOKEN_LOCAL_STORAGE_KEY)} + '=; Max-Age=0; Path=/; SameSite=Lax'; document.cookie = {json.dumps(GUEST_TOKEN_LOCAL_STORAGE_KEY)} + '=; Max-Age=0; Path=/; SameSite=Lax'; }} catch(e) {{}}"
             ),
             rx.call_script("try { delete window.__ga4_user_id_last; } catch(e) {}"),
-            rx.redirect(reflex_local_auth.routes.LOGIN_ROUTE),
+            rx.call_script("window.location.href = '/login'"),
         ]
 
 
