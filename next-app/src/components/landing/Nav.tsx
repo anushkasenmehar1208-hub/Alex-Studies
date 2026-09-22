@@ -7,7 +7,7 @@ export function Nav() {
       className="relative w-full flex items-center justify-between px-4 md:px-7 py-5 max-w-[1280px] mx-auto"
       style={{ zIndex: 5 }}
     >
-      <Link href="/select" className="flex items-center gap-2.5">
+      <Link href="/" className="flex items-center gap-2.5">
         <Image
           src="/a_logo.png"
           alt=""
@@ -28,9 +28,9 @@ export function Nav() {
       </Link>
 
       <nav className="flex items-center gap-2.5">
-        <Link href="/select" className="landing-nav-cta">
+<Link href="/" className="landing-nav-cta">
           Home
-        </Link>
+</Link>
         <Link href="/login" className="landing-nav-cta">
           Login
         </Link>

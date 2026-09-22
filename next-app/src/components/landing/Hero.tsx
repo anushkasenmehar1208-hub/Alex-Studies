@@ -64,12 +64,12 @@ export function Hero() {
         track tasks, and help you study every day.
       </p>
 
-      <Link
-        href="/select"
+<Link
+        href="/app"
         className="landing-main-cta--solid mb-7"
       >
         Start My Study Plan
-      </Link>
+</Link>
 
       <div className="proof-chip">
         <span className="relative flex h-2 w-2">
