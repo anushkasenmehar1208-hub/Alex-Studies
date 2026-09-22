@@ -27,19 +27,19 @@ export function FeatureLandingPage({
       }}
     >
       <nav className="mx-auto flex max-w-[1120px] items-center justify-between px-5 py-6">
-        <Link
-          href="/"
-          className="text-[1rem] font-bold text-white/90 no-underline"
-        >
-          Alex Studies
-        </Link>
+<a
+           href="/"
+           className="text-[1rem] font-bold text-white/90 no-underline"
+         >
+           Alex Studies
+</a>
         <div className="flex items-center gap-2.5">
           <Link href="/login" className="landing-nav-cta">
             Login
           </Link>
-<Link href="/app" className="landing-nav-cta">
+<a href="/app" className="landing-nav-cta">
             Start
-</Link>
+</a>
         </div>
       </nav>
 
@@ -52,9 +52,9 @@ export function FeatureLandingPage({
           <p className="landing-sub mb-8 max-w-[640px] text-[1.05rem]">
             {description}
           </p>
-<Link href="/app" className="landing-main-cta--solid">
+<a href="/app" className="landing-main-cta--solid">
             Start Your Study Plan
-</Link>
+</a>
           <div className="mt-7 flex flex-wrap gap-2.5">
             {points.map((point) => (
               <span key={point} className="proof-chip">

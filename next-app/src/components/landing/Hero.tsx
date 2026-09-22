@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import Image from "next/image";
 
 export function Hero() {
@@ -64,12 +63,12 @@ export function Hero() {
         track tasks, and help you study every day.
       </p>
 
-<Link
+<a
         href="/app"
         className="landing-main-cta--solid mb-7"
       >
         Start My Study Plan
-</Link>
+</a>
 
       <div className="proof-chip">
         <span className="relative flex h-2 w-2">
