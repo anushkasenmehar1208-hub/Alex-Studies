@@ -328,7 +328,7 @@
   function authHeadersForGet() {
     var h = {};
     var t = authToken();
-    if (t) h['X-Auth-Token'] = t;
+    if (t) h['Authorization'] = 'Bearer ' + t;
     return h;
   }
 

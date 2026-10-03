@@ -16540,7 +16540,7 @@ Behavior rules:
                 f"try {{ localStorage.removeItem({json.dumps(AUTH_TOKEN_LOCAL_STORAGE_KEY)}); document.cookie = {json.dumps(AUTH_TOKEN_LOCAL_STORAGE_KEY)} + '=; Max-Age=0; Path=/; SameSite=Lax'; document.cookie = {json.dumps(GUEST_TOKEN_LOCAL_STORAGE_KEY)} + '=; Max-Age=0; Path=/; SameSite=Lax'; }} catch(e) {{}}"
             ),
             rx.call_script("try { delete window.__ga4_user_id_last; } catch(e) {}"),
-            rx.redirect(reflex_local_auth.routes.LOGIN_ROUTE),
+            rx.call_script("window.location.href = '/login'"),
         ]
 
 
@@ -36738,13 +36738,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "https://www.youtube.com https://s.ytimg.com "
             "https://unpkg.com https://cdn.jsdelivr.net; "
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com; "
+            "font-src 'self' data: https://fonts.gstatic.com; "
             "img-src 'self' data: blob: https: http:; "
-            "media-src 'self' blob:; "
+            "media-src 'self' data: blob:; "
             "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
             "connect-src 'self' wss: ws: https:; "
-            "worker-src 'self' blob:; "
-            "wasm-src 'self' https://unpkg.com https://cdn.jsdelivr.net;",
+            "worker-src 'self' blob:; ",
         )
         return response
 
