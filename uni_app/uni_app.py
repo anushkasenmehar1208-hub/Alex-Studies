@@ -36743,7 +36743,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "media-src 'self' data: blob:; "
             "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
             "connect-src 'self' wss: ws: https:; "
-            "worker-src 'self' blob:; ",
+            "worker-src 'self' blob:;",
         )
         return response
 
