@@ -305,7 +305,15 @@
   function authToken() {
     try {
       var k = window.ALEX_AUTH_STORAGE_KEY || '';
-      return k ? (localStorage.getItem(k) || '') : '';
+      var raw = k ? (localStorage.getItem(k) || '').trim() : '';
+      if (!raw) return '';
+      // Reflex stores LocalStorage strings as JSON; Next.js stores plain strings.
+      try {
+        var decoded = JSON.parse(raw);
+        return typeof decoded === 'string' ? decoded.trim() : '';
+      } catch (eParse) {
+        return raw;
+      }
     } catch (e) {
       return '';
     }
@@ -328,7 +336,7 @@
   function authHeadersForGet() {
     var h = {};
     var t = authToken();
-    if (t) h['Authorization'] = 'Bearer ' + t;
+    if (t) h['X-Auth-Token'] = t;
     return h;
   }
 
