@@ -26,11 +26,10 @@ const DEGREE_CODE_TO_REFLEX_NAME: Record<string, string> = {
 const ONBOARDING_FINAL_STEP = 6;
 
 function resolveDegreeName(country: string, degree: string): string {
-  const direct = DEGREE_CODE_TO_REFLEX_NAME[degree];
-  if (direct) return direct;
-  // UK/US share the generic "cs" / "se" codes — disambiguate by country.
-  const compound = `${degree}-${country}`;
-  return DEGREE_CODE_TO_REFLEX_NAME[compound] ?? "Custom";
+  // UK/US share generic codes with Sri Lanka; resolve the country first.
+  return DEGREE_CODE_TO_REFLEX_NAME[`${degree}-${country}`]
+    ?? DEGREE_CODE_TO_REFLEX_NAME[degree]
+    ?? "Custom";
 }
 
 // The Next.js form sends scope-codes like "y1s1" / "y2s4" — Reflex
@@ -90,6 +89,19 @@ export async function POST(req: NextRequest) {
         { error: "country, degree, and semester are required." },
         { status: 400 }
       );
+    }
+
+    const allowedDegrees: Record<string, string[]> = {
+      lk: ["se", "elcs", "ps", "bs"],
+      uk: ["cs", "se"],
+      us: ["cs", "se"],
+      in: ["btech-cs", "btech-it"],
+    };
+    const scope = semester.match(/^y([1-4])s([1-8])$/);
+    if (!allowedDegrees[country]?.includes(degree) || !scope ||
+        Math.ceil(Number(scope[2]) / 2) !== Number(scope[1]) ||
+        ((degree === "ps" || degree === "bs") && !pathway)) {
+      return NextResponse.json({ error: "Choose a valid country, degree, pathway, and semester." }, { status: 400 });
     }
 
     const reflexDegree = resolveDegreeName(country, degree);

@@ -27,12 +27,12 @@ export function FeatureLandingPage({
       }}
     >
       <nav className="mx-auto flex max-w-[1120px] items-center justify-between px-5 py-6">
-<a
+<Link
            href="/"
            className="text-[1rem] font-bold text-white/90 no-underline"
          >
            Alex Studies
-</a>
+</Link>
         <div className="flex items-center gap-2.5">
           <Link href="/login" className="landing-nav-cta">
             Login

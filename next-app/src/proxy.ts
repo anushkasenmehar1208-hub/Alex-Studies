@@ -9,12 +9,26 @@ const NEXT_PATHS = [
   "/select",
   "/login",
   "/register",
+  "/forgot-password",
+  "/privacy",
   "/onboarding",
   "/generate-plan",
   "/exam-forecast",
   "/learn-with-youtube",
   "/robots.txt",
   "/sitemap.xml",
+  "/a_logo.png",
+  "/landing-notes-demo.png",
+  "/landing-voice-demo.png",
+  "/landing-tracker-demo.png",
+  "/landing-onboarding-demo.png",
+  "/landing-hero-demo.png",
+  "/landing-quiz-demo.png",
+  "/file.svg",
+  "/globe.svg",
+  "/next.svg",
+  "/vercel.svg",
+  "/window.svg",
 ];
 
 const NEXT_PREFIXES = [
@@ -37,7 +51,7 @@ function normalizeOrigin(origin: string): string {
   }
 }
 
-export async function middleware(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   const { pathname, search, origin } = req.nextUrl;
 
   // After Next.js /onboarding redirects here with ?onboarded=1, send
@@ -124,15 +138,24 @@ export async function middleware(req: NextRequest) {
     headers.set("cookie", cookieHeader);
   }
 
-  const upstreamRes = await fetch(upstream, {
-    method: req.method,
-    headers,
-    body:
-      req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
-    redirect: "manual",
-    // @ts-expect-error: Node fetch supports duplex for streaming
-    duplex: "half",
-  });
+  let upstreamRes: Response;
+  try {
+    upstreamRes = await fetch(upstream, {
+      method: req.method,
+      headers,
+      body:
+        req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
+      redirect: "manual",
+      signal: AbortSignal.timeout(30_000),
+      // @ts-expect-error: Node fetch supports duplex for streaming
+      duplex: "half",
+    });
+  } catch {
+    return new NextResponse("The study workspace is temporarily unavailable. Please try again shortly.", {
+      status: 502,
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
 
   const resHeaders = new Headers(upstreamRes.headers);
   resHeaders.delete("content-encoding");
@@ -145,14 +168,10 @@ export async function middleware(req: NextRequest) {
   // relative Locations, so we keep the URL absolute.
   const loc = resHeaders.get("location");
   if (loc) {
-    const requestOrigin = normalizeOrigin(req.nextUrl.origin);
-    const backendOrigin = normalizeOrigin(REFLEX_BACKEND_URL);
-    // Rewrite any redirect pointing to the backend origin to the frontend origin.
-    const rewritten = loc.replace(
-      new RegExp(`^${backendOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
-      requestOrigin
-    );
-    if (rewritten !== loc) resHeaders.set("location", rewritten);
+    const target = new URL(loc, upstream);
+    if (target.origin === normalizeOrigin(REFLEX_BACKEND_URL)) {
+      resHeaders.set("location", new URL(target.pathname + target.search + target.hash, origin).href);
+    }
   }
 
   return new NextResponse(upstreamRes.body, {

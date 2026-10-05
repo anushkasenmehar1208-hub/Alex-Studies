@@ -3,6 +3,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Check, ChevronDown } from "lucide-react";
+import { readBrowserToken } from "@/lib/browser-storage";
 
 type Country = {
   code: string;
@@ -351,21 +352,25 @@ export default function OnboardingPage() {
   const [semester, setSemester] = useState("");
   const [semesterOpen, setSemesterOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
   // True until the status check confirms the user still needs to
   // onboard — keeps the form hidden so already-onboarded users don't
   // see a flash before the /app redirect kicks in.
   const [checkingStatus, setCheckingStatus] = useState(true);
 
   useEffect(() => {
-    const rawToken =
-      typeof window !== "undefined"
-        ? window.localStorage.getItem("_auth_token") ?? ""
-        : "";
-    const token = rawToken.replace(/^"|"$/g, "");
+    const token = readBrowserToken("_auth_token");
     const headers: Record<string, string> = {};
     if (token) headers["Authorization"] = `Bearer ${token}`;
     fetch("/api/onboarding/status", { headers })
-      .then((r) => (r.ok ? r.json() : null))
+      .then((r) => {
+        if (r.status === 401) {
+          window.location.href = "/login";
+          return null;
+        }
+        if (!r.ok) throw new Error("Could not load your study plan.");
+        return r.json();
+      })
       .then((data) => {
         const m = data?.memory;
         if (m && m.is_started && m.degree && m.selected_year && m.selected_semester) {
@@ -412,24 +417,25 @@ export default function OnboardingPage() {
   async function handleFinish() {
     if (!canFinish) return;
     setLoading(true);
+    setError("");
     try {
       // Google OAuth users only have the token in localStorage (no
       // cookie), so forward it explicitly. Reflex stores the token
       // as a JSON-quoted string, so strip the quotes if present.
-      const rawToken =
-        typeof window !== "undefined"
-          ? window.localStorage.getItem("_auth_token") ?? ""
-          : "";
-      const token = rawToken.replace(/^"|"$/g, "");
+      const token = readBrowserToken("_auth_token");
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
       if (token) headers["Authorization"] = `Bearer ${token}`;
-      await fetch("/api/onboarding/complete", {
+      const response = await fetch("/api/onboarding/complete", {
         method: "POST",
         headers,
         body: JSON.stringify({ country, degree, pathway: pathway || null, semester }),
       });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.error || "Could not save your study plan. Please try again.");
+      }
       // The ?onboarded=1&scope=y1s1 flag tells the middleware to 302
       // directly to /s/y{N}s{M}, skipping Reflex's hydration race
       // (which otherwise lands the user on /select or shows the
@@ -437,8 +443,10 @@ export default function OnboardingPage() {
       // because Safari Private doesn't reliably set our auth cookie,
       // so the middleware can't look it up via the status endpoint.
       window.location.href = `/app?onboarded=1&scope=${encodeURIComponent(semester)}`;
-    } catch {
-      window.location.href = "/app";
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save your study plan. Please try again.");
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -536,6 +544,7 @@ export default function OnboardingPage() {
               </div>
             </Section>
 
+            {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
             <AnimatePresence initial={false}>
               {country && (
                 <Section
@@ -584,7 +593,7 @@ export default function OnboardingPage() {
                 </Section>
               )}
 
-              {canFinish && (
+              {(canFinish || loading) && (
                 <motion.div
                   key="cta"
                   {...reveal}

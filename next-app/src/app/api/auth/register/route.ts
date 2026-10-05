@@ -54,9 +54,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (password.length < 8) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+      return NextResponse.json({ error: "Enter a valid email address." }, { status: 400 });
+    }
+
+    if (Buffer.byteLength(password, "utf8") > 72) {
+      return NextResponse.json({ error: "Password must be at most 72 UTF-8 bytes." }, { status: 400 });
+    }
+
+    if (password.length < 8 || !/[a-zA-Z]/.test(password) || !/\d/.test(password)) {
       return NextResponse.json(
-        { error: "Password must be at least 8 characters." },
+        { error: "Password must be at least 8 characters with a letter and a number." },
         { status: 400 }
       );
     }

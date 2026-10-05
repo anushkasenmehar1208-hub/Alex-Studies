@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { readBrowserToken } from "@/lib/browser-storage";
 import { useState } from "react";
 import { AuthCard } from "@/components/auth/AuthCard";
 import { GoogleButton } from "@/components/auth/GoogleButton";
@@ -13,19 +14,6 @@ export default function LoginPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
-  function readGuestToken() {
-    const raw =
-      typeof window !== "undefined"
-        ? window.localStorage.getItem("alex_guest_token") ?? ""
-        : "";
-    try {
-      const parsed = JSON.parse(raw);
-      return typeof parsed === "string" ? parsed : raw;
-    } catch {
-      return raw;
-    }
-  }
-
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
@@ -37,7 +25,7 @@ export default function LoginPage() {
         body: JSON.stringify({
           username,
           password,
-          guestToken: readGuestToken(),
+          guestToken: readBrowserToken("alex_guest_token"),
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -86,12 +74,13 @@ export default function LoginPage() {
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-white/[0.45] text-[0.78rem] mb-0.5 font-medium">
+            <label htmlFor="username" className="block text-white/[0.45] text-[0.78rem] mb-0.5 font-medium">
               Username
             </label>
             <input
               type="text"
               required
+              id="username"
               autoComplete="username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
@@ -101,13 +90,14 @@ export default function LoginPage() {
           </div>
 
           <div>
-            <label className="block text-white/[0.45] text-[0.78rem] mb-0.5 font-medium">
+            <label htmlFor="password" className="block text-white/[0.45] text-[0.78rem] mb-0.5 font-medium">
               Password
             </label>
             <div className="relative">
               <input
                 type={showPassword ? "text" : "password"}
                 required
+                id="password"
                 autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -116,6 +106,8 @@ export default function LoginPage() {
               />
               <button
                 type="button"
+                aria-label={showPassword ? "Hide password" : "Show password"}
+                aria-pressed={showPassword}
                 onClick={() => setShowPassword(!showPassword)}
                 className="absolute right-[10px] top-1/2 flex h-5 -translate-y-1/2 items-center border-none bg-transparent p-0 text-white/[0.35] transition-colors hover:text-white/70"
               >
@@ -129,7 +121,7 @@ export default function LoginPage() {
           </div>
 
           {error && (
-            <div className="text-red-400 text-[0.88rem] bg-red-500/[0.08] border border-red-500/20 rounded-xl px-3.5 py-2.5">
+            <div role="alert" className="text-red-400 text-[0.88rem] bg-red-500/[0.08] border border-red-500/20 rounded-xl px-3.5 py-2.5">
               {error}
             </div>
           )}
