@@ -10,6 +10,7 @@ httpx
 itsdangerous
 PyMuPDF
 python-docx
+reportlab>=4.0  # Smart Exam Forecast: deterministic PDF rendering for predicted paper + answer guide
 ddgs
 dodopayments[webhooks]
 markdown>=3.5
