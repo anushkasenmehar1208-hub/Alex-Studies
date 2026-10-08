@@ -53,7 +53,7 @@ function browser(options = {}) {
     return value;
   }
   class Recorder {
-    static isTypeSupported(mime) { return mime === 'audio/mp4'; }
+    static isTypeSupported(mime) { return mime === (options.mime || 'audio/mp4'); }
     constructor(media, opts) { this.stream = media; this.mimeType = opts.mimeType; this.state = 'inactive'; recorders.push(this); }
     start() {
       if (options.startFailure) { options.startFailure = false; throw new Error('Recorder starting failed'); }
@@ -73,7 +73,12 @@ function browser(options = {}) {
     resume() { calls.push({kind: 'resume'}); return options.suspended ? new Promise(() => {}) : Promise.resolve(); }
     close() { this.state = 'closed'; return Promise.resolve(); }
     createMediaStreamSource() { return {connect() {}}; }
-    createAnalyser() { return {fftSize: 512, getByteTimeDomainData(array) { array.fill(128 + energy); }}; }
+    createGain() { return {gain: {value: 1}, connect() {}}; }
+    createAnalyser() {
+      const node = {fftSize: 512, connect() {}, getByteTimeDomainData(array) { array.fill(128 + energy); }};
+      if (options.floatAnalyser) node.getFloatTimeDomainData = array => array.fill(energy / 128);
+      return node;
+    }
   }
   const window = {
     AudioContext, MediaRecorder: Recorder, innerWidth: 1280, location: {pathname: '/s/home'},
@@ -96,7 +101,7 @@ function browser(options = {}) {
     addEventListener(type, fn) { documentListeners.set(type, fn); },
     removeEventListener(type, fn) { if (documentListeners.get(type) === fn) documentListeners.delete(type); },
   };
-  const json = body => ({ok: true, headers: {get: () => 'application/json'}, json: async () => body});
+  const json = body => ({ok: true, status: 200, headers: {get: () => 'application/json'}, json: async () => body});
   async function fetch(url, init = {}) {
     calls.push({kind: 'fetch', url, init, at: now});
     if (url.includes('voice-intro')) return intro.promise;
@@ -115,7 +120,7 @@ function browser(options = {}) {
     },
   }}, location: {port: '', protocol: 'https:', hostname: 'example.test'},
   localStorage: {getItem: () => '"test-token"', setItem() {}},
-  console: {log() {}, warn() {}, error() {}}, Blob, Response, TextDecoder, Uint8Array,
+  console: {log(...args) { calls.push({kind: 'log', args}); }, warn() {}, error() {}}, Blob, Response, TextDecoder, Uint8Array,
   MediaRecorder: Recorder, AbortController, Promise, fetch,
   Date: class extends Date { static now() { return now; } },
   Audio: function () { this.play = () => Promise.resolve(); this.pause = () => {}; this.removeAttribute = () => {}; this.load = () => {}; },
@@ -154,7 +159,7 @@ function browser(options = {}) {
 test('Start Call immediately requests the microphone, then listens automatically without Unmute', async () => {
   const b = browser();
   const started = b.window.toggleAlexVoice();
-  assert.equal(b.calls.findIndex(c => c.kind === 'resume'), 0);
+  assert.ok(b.calls.findIndex(c => c.kind === 'resume') < b.calls.findIndex(c => c.kind === 'microphone'));
   assert.equal(b.calls.filter(c => c.kind === 'microphone').length, 1);
   await started; await flush();
   assert.equal(b.status(), 'Listening…');
@@ -422,3 +427,39 @@ for (const [status, code, expected] of [
     b.window.stopAlexVoiceSession();
   });
 }
+
+
+test('quiet speech below the previous RMS 18 threshold submits once after 425 ms silence', async () => {
+  const b = browser(); await b.start();
+  b.energy(8); await b.advance(300);
+  assert.equal(b.window.getAlexVoiceDiagnostics().speechDetected, true);
+  b.energy(0); await b.advance(450);
+  assert.equal(b.sttCalls().length, 1);
+  assert.equal(b.elements['alex-chat-panel'].children[0].textContent, 'Explain photosynthesis');
+  const stages = b.calls.filter(c => c.kind === 'log').map(c => c.args[0]);
+  for (const stage of ['speech-detected', 'silence-started', 'silence-completed', 'recorder-stop-requested',
+    'recorder-stopped', 'audio-blob', 'stt-request-sent', 'stt-response', 'transcript-accepted', 'reply-request-sent']) {
+    assert.ok(stages.includes('[AlexVoice] ' + stage), stage);
+  }
+  assert.ok(!JSON.stringify(b.calls.filter(c => c.kind === 'log')).includes('Explain photosynthesis'));
+  b.window.stopAlexVoiceSession();
+});
+
+test('silence without real speech never submits audio or immediately restarts a recorder', async () => {
+  const b = browser(); await b.start();
+  b.energy(1); await b.advance(11975);
+  assert.equal(b.sttCalls().length, 0);
+  assert.equal(b.window.getAlexVoiceDiagnostics().speechDetected, false);
+  b.window.stopAlexVoiceSession();
+  assert.equal(b.timers.size, 0);
+});
+
+
+test('Safari float analyser and codec-qualified MP4 produce a valid STT upload', async () => {
+  const b = browser({floatAnalyser: true, mime: 'audio/mp4;codecs=mp4a.40.2'}); await b.start();
+  b.energy(5.5); await b.advance(350); b.energy(0); await b.advance(450);
+  assert.equal(b.sttCalls().length, 1);
+  assert.equal(b.sttCalls()[0].init.body.type, 'audio/mp4;codecs=mp4a.40.2');
+  assert.equal(b.window.getAlexVoiceDiagnostics().sttStatus, 200);
+  b.window.stopAlexVoiceSession();
+});

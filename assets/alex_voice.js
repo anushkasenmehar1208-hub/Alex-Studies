@@ -13,6 +13,22 @@
   var limitTimer = null;
   var active = false;
   var starting = false;
+  var voiceDiagnostics = { stage: 'idle' };
+  function traceVoice(stage, details) {
+    voiceDiagnostics = Object.assign({}, voiceDiagnostics, details || {}, { stage: stage });
+    if (window.ALEX_VOICE_DIAGNOSTICS !== false) console.log('[AlexVoice] ' + stage, details || {});
+  }
+  // Safe temporary troubleshooting: sizes/states only, never tokens, audio or speech text.
+  window.getAlexVoiceDiagnostics = function () {
+    return Object.assign({}, voiceDiagnostics, {
+      active: active, processing: processing, speechDetected: speechDetected,
+      contextState: audioContext ? audioContext.state : 'closed',
+      recorderState: mediaRecorder ? mediaRecorder.state : 'inactive',
+      tracks: micStream ? micStream.getTracks().map(function (track) {
+        return { enabled: track.enabled, readyState: track.readyState };
+      }) : []
+    });
+  };
   var callGeneration = 0;
   var callAbort = null;
   var callButton = null;
@@ -404,9 +420,9 @@
   // Raw time-domain RMS is noisy; smooth + require sustained energy before “speech”
   var VAD_EMA_ALPHA = 0.28;
   // Must exceed this (after smoothing) to count toward speech onset — filters keyboard/fan hum
-  var VAD_SPEECH_START_RMS = 18;
+  var VAD_SPEECH_START_RMS = 4;
   // Lower threshold after speech began — keeps natural pauses inside a sentence
-  var VAD_SPEECH_END_RMS = 10;
+  var VAD_SPEECH_END_RMS = 2;
   // Require this many ms of continuous “loud” before we treat it as real speech
   var VAD_SPEECH_SUSTAIN_MS = 140;
   // Reject tiny clips after real speech has armed VAD.
@@ -919,6 +935,7 @@
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
       var resumed = audioContext.resume().catch(function () {});
       try { if (window.speechSynthesis) window.speechSynthesis.resume(); } catch (eResume) {}
+      traceVoice('microphone-requested');
       var stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
@@ -928,6 +945,7 @@
         return;
       }
       micStream = stream;
+      traceVoice('microphone-ready', { trackCount: stream.getAudioTracks().length });
       await Promise.race([resumed, new Promise(function (resolve) {
         audioResumeTimer = setTimeout(resolve, 1500);
       })]);
@@ -939,6 +957,11 @@
       analyser = audioContext.createAnalyser();
       analyser.fftSize = 512;
       source.connect(analyser);
+      // Keep the input graph processing in Safari without routing mic sound to speakers.
+      var silentMonitor = audioContext.createGain();
+      silentMonitor.gain.value = 0;
+      analyser.connect(silentMonitor);
+      silentMonitor.connect(audioContext.destination);
     } catch (e) {
       if (!starting || generation !== callGeneration) return;
       stopAlex(true, true);
@@ -1046,10 +1069,9 @@
     setTranscript('');
 
     // Choose supported mime
-    var mimeType = 'audio/webm;codecs=opus';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/webm';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/mp4';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = '';
+    var mimeType = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4',
+      'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg']
+      .filter(function (type) { return MediaRecorder.isTypeSupported(type); })[0] || '';
 
     try {
       mediaRecorder = new MediaRecorder(micStream, mimeType ? { mimeType: mimeType } : {});
@@ -1064,11 +1086,15 @@
 
     var recorder = mediaRecorder;
     recorder.ondataavailable = function (e) {
-      if (isCurrentCall(generation) && mediaRecorder === recorder && e.data && e.data.size > 0) chunks.push(e.data);
+      if (isCurrentCall(generation) && mediaRecorder === recorder && e.data && e.data.size > 0) {
+        chunks.push(e.data);
+        traceVoice('recorder-data', { chunkBytes: e.data.size, mimeType: e.data.type || recorder.mimeType });
+      }
     };
 
     recorder.onstop = function () {
       if (!isCurrentCall(generation) || mediaRecorder !== recorder || micMuted()) return;
+      traceVoice('recorder-stopped', { speechDetected: speechDetected, chunkCount: chunks.length });
       stopVAD();
       mediaRecorder = null;
       audioChunks = [];
@@ -1079,13 +1105,24 @@
       }
       if (!speechDetected || chunks.length === 0) {
         processing = false;
-        startListening();
+        traceVoice('recording-rejected', { reason: speechDetected ? 'empty_audio' : 'no_speech' });
+        if (speechDetected) {
+          setStatus(voiceErrorMessage(0, 'stt', true));
+          appendVoiceServerNotice(voiceErrorMessage(0, 'stt', true));
+        }
+        scheduleListenAfterSpeech(speechDetected ? 1500 : 500);
         return;
       }
 
-      var blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
-      console.log('[AlexVoice] recorded', blob.size, 'B, vadSpeech=' + speechDetected);
-      if (blob.size < MIN_BLOB_FOR_STT) { processing = false; startListening(); return; }
+      var blob = new Blob(chunks, { type: recorder.mimeType || chunks[0].type || mimeType });
+      traceVoice('audio-blob', { blobBytes: blob.size, mimeType: blob.type });
+      if (blob.size < MIN_BLOB_FOR_STT) {
+        processing = false;
+        traceVoice('recording-rejected', { reason: 'tiny_audio' });
+        setStatus(voiceErrorMessage(0, 'stt', true));
+        scheduleListenAfterSpeech(1500);
+        return;
+      }
 
       processing = true;
       setOrbState('thinking');
@@ -1113,31 +1150,40 @@
 
     scheduleNoSpeechNudge();
 
-    console.log('[AlexVoice] recording...');
+    traceVoice('recorder-started', { mimeType: recorder.mimeType, speechDetected: false });
   }
 
   // ── Voice Activity Detection ────────────────────────────────
   function startVAD() {
     if (!analyser) return;
-    var dataArray = new Uint8Array(analyser.fftSize);
+    var useFloat = typeof analyser.getFloatTimeDomainData === 'function';
+    var dataArray = useFloat ? new Float32Array(analyser.fftSize) : new Uint8Array(analyser.fftSize);
+    var lastMeterLog = 0;
 
     vadInterval = setInterval(function () {
       if (!active || processing || micMuted()) return;
-      analyser.getByteTimeDomainData(dataArray);
+      if (useFloat) analyser.getFloatTimeDomainData(dataArray);
+      else analyser.getByteTimeDomainData(dataArray);
 
       var sum = 0;
       for (var i = 0; i < dataArray.length; i++) {
-        var v = dataArray[i] - 128;
+        var v = useFloat ? dataArray[i] * 128 : dataArray[i] - 128;
         sum += v * v;
       }
       var rawRms = Math.sqrt(sum / dataArray.length);
       vadSmoothedRms = vadSmoothedRms * (1 - VAD_EMA_ALPHA) + rawRms * VAD_EMA_ALPHA;
 
       var now = Date.now();
+      if (now - lastMeterLog >= 1000) {
+        lastMeterLog = now;
+        traceVoice('vad-level', { rms: Number(rawRms.toFixed(2)),
+          startThreshold: VAD_SPEECH_START_RMS, endThreshold: VAD_SPEECH_END_RMS,
+          speechDetected: speechDetected, contextState: audioContext.state });
+      }
 
       if (!speechDetected) {
         // Ignore brief spikes: only arm after sustained energy
-        if (vadSmoothedRms >= VAD_SPEECH_START_RMS) {
+        if (rawRms >= VAD_SPEECH_START_RMS && vadSmoothedRms >= VAD_SPEECH_START_RMS) {
           if (!vadSustainStart) vadSustainStart = now;
           if (now - vadSustainStart >= VAD_SPEECH_SUSTAIN_MS) {
             speechDetected = true;
@@ -1147,7 +1193,7 @@
             setOrbState('user-speaking');
             setStatus('Listening…');
             silenceStart = 0;
-            console.log('[AlexVoice] speech started (sustained)');
+            traceVoice('speech-detected', { rms: Number(rawRms.toFixed(2)) });
           }
         } else {
           vadSustainStart = 0;
@@ -1157,9 +1203,9 @@
         if (rawRms >= VAD_SPEECH_END_RMS) {
           silenceStart = 0;
         } else {
-          if (!silenceStart) silenceStart = now;
+          if (!silenceStart) { silenceStart = now; traceVoice('silence-started'); }
           else if (now - silenceStart >= END_OF_SPEECH_SILENCE_MS) {
-            console.log('[AlexVoice] silence detected, auto-stopping');
+            traceVoice('silence-completed', { silenceMs: now - silenceStart });
             finishRecording();
           }
         }
@@ -1200,6 +1246,7 @@
       setOrbState('thinking');
     }
     if (mediaRecorder && mediaRecorder.state === 'recording') {
+      traceVoice('recorder-stop-requested', { speechDetected: speechDetected });
       mediaRecorder.stop();
     }
   }
@@ -1348,7 +1395,7 @@
     var uLine = window.__voiceLastUserLine || '';
     window.__voiceLastUserLine = '';
     applyAlexLanguagePrefsFromVoice(data);
-    console.log('[AlexVoice] response:', (data.text || '').substring(0, 80), '| audio:', (data.audio_b64 || '').length);
+    traceVoice('reply-received', { replyLength: (data.text || '').length, audioBytesEncoded: (data.audio_b64 || '').length });
     disposeCurrentPlayback();
     setOrbState('ai-speaking');
     setStatus('Alex is speaking...');
@@ -1520,6 +1567,7 @@
     setStatus('Thinking…');
     var transcript = '';
     try {
+      traceVoice('stt-request-sent', { blobBytes: audioBlob.size, mimeType: audioBlob.type });
       var sttResp = await fetch(apiBase() + '/api/alex-voice-stt', {
         method: 'POST',
         headers: authHeadersForStt(audioBlob.type),
@@ -1527,6 +1575,7 @@
         signal: callAbort.signal
       });
       if (!isCurrentCall(generation)) return;
+      traceVoice('stt-response', { sttStatus: sttResp.status });
       if (!sttResp.ok) {
         if (handleVoiceHttpError(sttResp.status)) return;
         var sttErr = voiceErrorMessage(sttResp.status, '', true);
@@ -1545,6 +1594,7 @@
       var sttData = await sttResp.json();
       if (!isCurrentCall(generation)) return;
       transcript = !sttData.error && typeof sttData.text === 'string' ? sttData.text.trim() : '';
+      traceVoice(transcript ? 'transcript-accepted' : 'transcript-rejected', { transcriptLength: transcript.length });
       if (transcript) {
         window.__voiceLastUserLine = 'You: ' + transcript;
         appendChatBubble('user', null, transcript);
@@ -1571,6 +1621,7 @@
       return;
     }
 
+    traceVoice('reply-request-sent');
     await fetchVoiceReplyAndPlay(transcript);
   }
 
@@ -1582,6 +1633,7 @@
     // Invalidate callbacks FIRST, then release hardware before any network/UI work.
     active = false;
     starting = false;
+    traceVoice('call-ended');
     processing = false;
     callGeneration++;
     if (callAbort) callAbort.abort();

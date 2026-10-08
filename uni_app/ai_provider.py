@@ -102,6 +102,10 @@ GROQ_TIMEOUT = httpx.Timeout(35.0, connect=5.0)
 def text_payload(config, messages, max_tokens, temperature=None, *, stream=False):
     payload = {"model": config.text_model, "messages": messages,
                "max_tokens": min(max_tokens, 2048) if config.demo else max_tokens}
+    if config.text_model in ("openai/gpt-oss-20b", "openai/gpt-oss-120b"):
+        # This budget includes reasoning tokens; tiny voice limits exhausted it before speech.
+        payload["max_tokens"] = max(payload["max_tokens"], 1024)
+        payload["reasoning_effort"] = "low"
     if temperature is not None:
         payload["temperature"] = temperature
     if stream:

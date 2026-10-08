@@ -38062,10 +38062,11 @@ def _db_user_plan_tier(uid: int) -> str:
 
 
 async def alex_voice_stt(request: Request):
-    """Receive raw audio from the browser, transcribe with OpenAI Whisper."""
+    """Receive raw browser audio and transcribe with the configured server STT provider."""
     _prune_stale_voice_sessions()
     st_uid = _voice_request_uid(request)
     if st_uid < 0:
+        logger.info("Voice STT rejected http_status=401 reason=unauthenticated")
         return JSONResponse({"error": "Unauthorized", "text": ""}, status_code=401)
     if not (AI_CONFIG.api_key if AI_CONFIG.uses_groq else OPENAI_API_KEY):
         return JSONResponse(
@@ -38075,8 +38076,12 @@ async def alex_voice_stt(request: Request):
 
     content_type = request.headers.get("content-type", "")
     audio_bytes = await request.body()
+    logger.info("Voice STT received bytes=%s mime=%s provider=%s model=%s",
+                len(audio_bytes), content_type.split(";", 1)[0][:40], AI_CONFIG.provider,
+                AI_CONFIG.stt_model if AI_CONFIG.uses_groq else OPENAI_STT_MODEL)
     if not audio_bytes or len(audio_bytes) < 40:
-        return JSONResponse({"text": ""})
+        logger.info("Voice STT rejected http_status=422 reason=empty_audio")
+        return JSONResponse({"text": "", "error": ai_provider.STT_ERROR, "error_code": "stt"}, status_code=422)
     if len(audio_bytes) > 5 * 1024 * 1024:
         return JSONResponse({"text": "", "error": "Recording too large. Please use a shorter clip."}, status_code=413)
     try:
@@ -38086,6 +38091,7 @@ async def alex_voice_stt(request: Request):
     if AI_CONFIG.uses_groq:
         try:
             text = await ai_provider.transcribe(AI_CONFIG, audio_bytes, content_type)
+            logger.info("Voice STT completed http_status=200 provider=groq model=%s transcript_length=%s", AI_CONFIG.stt_model, len(text))
             return JSONResponse({"text": text})
         except Exception as exc:
             error = ai_provider.failure(exc, "stt", AI_CONFIG, logger)

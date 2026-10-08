@@ -195,7 +195,7 @@ class DemoProviderTests(unittest.TestCase):
             calls.append(req)
             return httpx.Response(200, json={"text": " spoken question "})
         real = httpx.AsyncClient
-        for mime, filename in [("audio/webm;codecs=opus", "audio.webm"), ("audio/mp4", "audio.m4a"), ("audio/ogg", "audio.ogg")]:
+        for mime, filename in [("audio/webm;codecs=opus", "audio.webm"), ("audio/mp4", "audio.m4a"), ("audio/mp4;codecs=mp4a.40.2", "audio.m4a"), ("audio/ogg", "audio.ogg")]:
             with self.subTest(mime=mime), patch.object(ai_provider.httpx, "AsyncClient", side_effect=lambda **kw: real(transport=httpx.MockTransport(respond), **kw)):
                 response = asyncio.run(handlers()["alex_voice_stt"](request(b"a" * 100, mime)))
                 self.assertEqual(json.loads(response.body)["text"], "spoken question")
@@ -247,6 +247,22 @@ class DemoProviderTests(unittest.TestCase):
             self.assertNotIn("NEVER_PRINT_ME", " ".join(logged.output))
         self.assertEqual(ai_provider.failure(httpx.ReadTimeout("secret"), "stream", DEMO, logging.getLogger("test")).code, "timeout")
         self.assertEqual(ai_provider.failure(httpx.ConnectError("secret"), "stream", DEMO, logging.getLogger("test")).code, "timeout")
+
+    def test_reasoning_voice_budget_leaves_room_for_a_visible_answer(self):
+        for budget in (120, 160, 220):
+            payload = ai_provider.text_payload(DEMO, [{"role": "user", "content": "Hello Alex"}], budget)
+            self.assertEqual(payload["max_tokens"], 1024)
+            self.assertEqual(payload["reasoning_effort"], "low")
+        from dataclasses import replace
+        payload = ai_provider.text_payload(replace(DEMO, text_model="llama-3.3-70b-versatile"), [], 220)
+        self.assertEqual(payload["max_tokens"], 220)
+        self.assertNotIn("reasoning_effort", payload)
+
+    def test_stt_rejects_empty_audio_before_any_provider_request(self):
+        with patch.object(ai_provider, "transcribe", side_effect=AssertionError("no empty upload")):
+            response = asyncio.run(handlers()["alex_voice_stt"](request(b"", "audio/mp4")))
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(json.loads(response.body)["error_code"], "stt")
 
     def test_empty_transcription_returns_retry_without_text(self):
         async def run():
