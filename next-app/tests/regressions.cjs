@@ -49,6 +49,18 @@ test('backend outages produce a controlled 502', async () => {
   assert.equal(response.status, 502);
   assert.equal(response.headers.get('cache-control'), 'no-store');
 });
+test('voice proxy deadlines exceed the Groq backend timeout and retain a bounded SSE lifetime', async () => {
+  const deadlines = [];
+  const { proxy } = load('proxy.ts', { globals: {
+    AbortSignal: { timeout(ms) { deadlines.push(ms); return undefined; } },
+    fetch: async () => new Response('OK'),
+  } });
+  await proxy(request('/api/alex-voice-stt'));
+  await proxy(request('/api/alex-voice'));
+  await proxy(request('/api/alex-voice-stream'));
+  await proxy(request('/s/home'));
+  assert.deepEqual(deadlines, [45000, 45000, 90000, 30000]);
+});
 test('proxy preserves API paths and adds a slash only for SPA pages', async () => {
   const urls = [];
   const { proxy } = load('proxy.ts', { globals: { fetch: async url => { urls.push(url); return new Response('OK'); } } });

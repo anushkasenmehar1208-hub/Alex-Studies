@@ -109,6 +109,8 @@ async def health() -> dict:
 
 @app.post("/render", response_model=RenderResponse)
 async def render(req: RenderRequest) -> RenderResponse:
+    if os.getenv("ALEX_DEMO_FREE_MODE", "false").strip().lower() in ("true", "1", "yes"):
+        raise HTTPException(403, "Live AI video generation is disabled in free demo mode")
     if not os.environ.get("OPENROUTER_API_KEY"):
         raise HTTPException(500, "OPENROUTER_API_KEY not configured on server")
     job_id = uuid.uuid4().hex[:16]

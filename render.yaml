@@ -41,6 +41,18 @@ services:
         sync: false
       - key: GOOGLE_REDIRECT_URI
         value: https://alexstudies.com/auth/google/callback
+      - key: ALEX_DEMO_FREE_MODE
+        value: "false"
+      - key: ALEX_TEXT_PROVIDER
+        value: openrouter
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: GROQ_TEXT_MODEL
+        value: openai/gpt-oss-20b
+      - key: GROQ_STT_MODEL
+        value: whisper-large-v3-turbo
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENAI_API_KEY

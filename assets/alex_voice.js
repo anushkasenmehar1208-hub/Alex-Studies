@@ -1,8 +1,8 @@
 /**
- * Alex Live Voice — OpenAI Whisper STT + OpenRouter LLM + server TTS only (WAV base64)
- * STT: OpenAI Whisper  (MediaRecorder → /api/alex-voice-stt, needs OPENAI_API_KEY)
- * LLM: OpenRouter      (/api/alex-voice, needs OPENROUTER_API_KEY)
- * TTS: Fish Audio if FISH_AUDIO_API_KEY, else OpenAI /v1/audio/speech — no browser / system robot voice
+ * Alex Live Voice — configurable server STT/LLM; browser TTS in free demo mode.
+ * STT: Groq in demo mode, OpenAI otherwise (MediaRecorder → /api/alex-voice-stt).
+ * LLM: Server-selected Groq or OpenRouter (/api/alex-voice-stream).
+ * TTS: Browser speech in demo mode; Fish/OpenAI WAV playback otherwise.
  */
 (function () {
   var sessionId = Math.random().toString(36).slice(2); // fallback only
@@ -14,6 +14,8 @@
   var micStream = null;
   var audioChunks = [];
   var currentAudio = null;
+  var browserUtterance = null;
+  var browserSpeechTimer = null;
   /** When using Blob URLs for TTS playback (Safari often fails on long data:audio/wav;base64,...). */
   var currentAudioObjectUrl = null;
   var maxRecordTimeout = null;
@@ -89,6 +91,14 @@
   var alexSseDone = false;
 
   function stopAlexPlaybackEngine() {
+    if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
+    browserSpeechTimer = null;
+    if (browserUtterance) {
+      browserUtterance.onend = null;
+      browserUtterance.onerror = null;
+      browserUtterance = null;
+      try { window.speechSynthesis.cancel(); } catch (eCancel) {}
+    }
     try {
       if (alexStreamActiveAudio) {
         alexStreamActiveAudio.onended = null;
@@ -162,6 +172,56 @@
     return alexAudioChain;
   }
 
+  // Browser speech is selected explicitly by the server; never call paid TTS from here.
+  function speakBrowserReply(data, onDone) {
+    var finished = false;
+    function finish(error) {
+      if (finished) return;
+      finished = true;
+      if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
+      browserSpeechTimer = null;
+      if (browserUtterance) {
+        browserUtterance.onend = null;
+        browserUtterance.onerror = null;
+      }
+      browserUtterance = null;
+      if (error) {
+        setStatus('Reply on screen only');
+        appendVoiceServerNotice('Browser speech is unavailable. Read the reply above or continue by typing.');
+      }
+      onDone();
+    }
+    var text = (data.speech_text || data.text || '').trim();
+    if (!text || !window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+      finish(true);
+      return;
+    }
+    try {
+      var utterance = new window.SpeechSynthesisUtterance(text);
+      var languages = { English: 'en-US', Sinhala: 'si-LK', Tamil: 'ta-IN', Hindi: 'hi-IN' };
+      utterance.lang = languages[data.voice_language] || document.documentElement.lang || 'en-US';
+      var voices = window.speechSynthesis.getVoices();
+      var language = utterance.lang.split('-')[0];
+      var voice = voices.find(function (v) { return v.lang.split('-')[0] === language && v.localService; })
+        || voices.find(function (v) { return v.lang.split('-')[0] === language; });
+      if (voice) utterance.voice = voice;
+      utterance.onend = function () { finish(false); };
+      utterance.onerror = function () { finish(true); };
+      browserUtterance = utterance;
+      processing = true;
+      setOrbState('ai-speaking');
+      setStatus('Alex is speaking...');
+      // Recover from browsers that never fire an end/error event.
+      browserSpeechTimer = setTimeout(function () {
+        finish(true);
+        try { window.speechSynthesis.cancel(); } catch (eCancel) {}
+      }, 60000);
+      window.speechSynthesis.speak(utterance);
+    } catch (eSpeech) {
+      finish(true);
+    }
+  }
+
   /**
    * SSE: first audio may arrive while the model is still generating; tail + done follow.
    */
@@ -208,7 +268,9 @@
         } else if (uLine) {
           setTranscript(uLine);
         }
-        if (!heardAudio) {
+        if (!heardAudio && obj.tts_mode === 'browser') {
+          speakBrowserReply(obj, streamPlaybackFinished);
+        } else if (!heardAudio) {
           streamPlaybackFinished();
         } else {
           alexAudioChain = alexAudioChain
@@ -222,6 +284,7 @@
         return;
       }
       if (obj.type === 'error') {
+        streamUiDone = true;
         appendVoiceServerNotice(obj.message || 'Voice reply failed.');
         try {
           window.__voiceLastUserLine = '';
@@ -253,7 +316,9 @@
           }
         }
       }
+      if (!streamUiDone) throw new Error('Voice stream ended before the reply completed');
     } catch (eRead) {
+      appendVoiceServerNotice('Voice connection was interrupted. Please try again.');
       console.error('[AlexVoice] stream read error:', eRead);
       stopAlexPlaybackEngine();
       processing = false;
@@ -1122,9 +1187,15 @@
 
     function done(opts) {
       opts = opts || {};
+      processing = false;
       if (!opts.keepReadingPane) setTranscript('');
       setOrbState('idle');
       if (active) scheduleListenAfterSpeech();
+    }
+
+    if (data.tts_mode === 'browser') {
+      speakBrowserReply(data, function () { done({ keepReadingPane: true }); });
+      return;
     }
 
     var tailState = { rest: (data.audio_b64_tail || '').trim() };

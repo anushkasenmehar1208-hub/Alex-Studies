@@ -17,6 +17,7 @@ from collections import OrderedDict, deque
 from difflib import SequenceMatcher
 from typing import Any
 
+from .ai_provider import CONFIG as AI_CONFIG
 from .alex_openrouter_prompts import ALEX_ROUTER_JSON_PROMPT_V1, ALEX_ROUTER_REFINEMENT_SUFFIX_V1
 
 PREMIUM_FRACTION_MAX = float(os.getenv("ALEX_PREMIUM_GLOBAL_FRACTION_MAX", "0.03"))
@@ -499,6 +500,8 @@ def next_escalation(
     premium_ok: bool,
 ) -> tuple[str, str] | None:
     """Next stronger model for quality retry; None if no escalation left."""
+    if AI_CONFIG.uses_groq:
+        return None
     tier = model_tier(current_model, teacher_m, reasoning_m, premium_m)
     if tier == 0:
         return reasoning_m, "r1"

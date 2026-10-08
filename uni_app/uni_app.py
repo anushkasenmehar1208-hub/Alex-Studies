@@ -88,6 +88,9 @@ from .alex_openrouter_prompts import (
 )
 from . import alex_routing
 from . import youtube_utils
+from . import ai_provider
+
+AI_CONFIG = ai_provider.CONFIG
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Colombo").strip() or "Asia/Colombo"
 
@@ -98,7 +101,7 @@ SESSION_SECRET          = os.getenv("SESSION_SECRET", "change-me-in-production")
 # Do not require OPENROUTER_API_KEY at import time: Docker `reflex export` may run without secrets.
 # ----------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-if not OPENROUTER_API_KEY:
+if not OPENROUTER_API_KEY and not AI_CONFIG.uses_groq:
     logger.warning("OPENROUTER_API_KEY is not set — AI features are disabled until the env var is configured.")
 
 OPENROUTER_TEACHER_MODEL = os.getenv("OPENROUTER_TEACHER_MODEL", "google/gemini-2.0-flash-001").strip() or "google/gemini-2.0-flash-001"
@@ -183,6 +186,8 @@ def _openai_generate_image_bytes(
     quality: str = "high",
 ) -> tuple[bytes, str, str]:
     """Generate an image with OpenAI. Returns (bytes, mime, error_message)."""
+    if AI_CONFIG.blocks_paid:
+        return b"", "", "Image generation is disabled in free demo mode."
     if not OPENAI_API_KEY:
         return b"", "", "OPENAI_API_KEY not set"
 
@@ -389,7 +394,7 @@ def rewrite_for_voice(text: str) -> str:
 
 
 def _openrouter_llm_ready() -> bool:
-    return bool(OPENROUTER_API_KEY)
+    return bool(AI_CONFIG.api_key) if AI_CONFIG.uses_groq else bool(OPENROUTER_API_KEY)
 
 
 def _openrouter_headers() -> dict[str, str]:
@@ -2034,6 +2039,12 @@ def _openrouter_complete(
     max_tokens: int = 2048,
     temperature: float | None = None,
 ) -> _LLMTextResponse:
+    if AI_CONFIG.uses_groq:
+        try:
+            return _LLMTextResponse(ai_provider.complete(AI_CONFIG, messages, max_tokens, temperature))
+        except Exception:
+            logger.warning("Groq completion failed; no provider fallback used")
+            return _LLMTextResponse(ai_provider.DEMO_ERROR if AI_CONFIG.api_key else "Demo AI is not configured. Ask the organizer to set GROQ_API_KEY on the server.")
     if not OPENROUTER_API_KEY:
         return _LLMTextResponse("API not ready")
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -2063,6 +2074,8 @@ def _openrouter_generate_with_fallback(
     fallback_model: str = OPENROUTER_AUX_FALLBACK_MODEL,
 ) -> Any:
     """Try primary model first. If rate-limited or returns rate-limit text, retry with fallback."""
+    if AI_CONFIG.uses_groq:
+        return _openrouter_generate_user_prompt(AI_CONFIG.text_model, contents, max_tokens)
     try:
         resp = _openrouter_generate_user_prompt(primary_model, contents, max_tokens)
         text = (getattr(resp, "text", "") or "").strip()
@@ -2153,6 +2166,8 @@ def _postprocess_svg(svg: str) -> str:
 
 def _openrouter_generate_svg(subject: str, *, teaching_context: str = "") -> str:
     """Generate an educational SVG via OpenRouter (multi-attempt, picks best-scoring output)."""
+    if AI_CONFIG.blocks_paid:
+        return ""
     if not OPENROUTER_API_KEY:
         return ""
     subj = (subject or "").strip()[:240]
@@ -2271,7 +2286,7 @@ Rules:
 
 
 def _openrouter_generate_teaching_spec(topic: str) -> dict[str, Any] | None:
-    if not OPENROUTER_API_KEY:
+    if not _openrouter_llm_ready():
         return None
     user_prompt = (
         f"Create a JSON schematic spec for teaching this topic: {topic}\n"
@@ -2582,6 +2597,8 @@ def _render_schematic_spec_svg(spec: dict[str, Any]) -> str:
 
 def _openrouter_read_image(image_bytes: bytes, mime_type: str, prompt: str) -> str:
     """Send an image + prompt to a vision-capable OpenRouter model."""
+    if AI_CONFIG.blocks_paid:
+        return "Image understanding is disabled in free demo mode. Please type your question."
     if not OPENROUTER_API_KEY:
         return "API not ready"
     try:
@@ -2983,6 +3000,8 @@ def _alex_budget_check_result(uid: int) -> dict[str, Any]:
 async def _openrouter_router_classify_structured(
     user_question: str, user_id: int = -1, refinement: str | None = None
 ) -> dict[str, Any]:
+    if AI_CONFIG.uses_groq:
+        return dict(alex_routing.DEFAULT_ROUTE)
     q = (user_question or "").strip()
     if len(q) < 4:
         alex_routing.log_request(
@@ -3059,6 +3078,14 @@ async def _openrouter_router_classify_structured(
 
 
 async def _openrouter_stream_async(model: str, messages: list[dict], max_tokens: int = 2048):
+    if AI_CONFIG.uses_groq:
+        try:
+            async for piece in ai_provider.stream(AI_CONFIG, messages, max_tokens):
+                yield piece
+        except Exception:
+            logger.warning("Groq stream failed; no provider fallback used")
+            yield ai_provider.DEMO_ERROR if AI_CONFIG.api_key else "Demo AI is not configured. Ask the organizer to set GROQ_API_KEY on the server."
+        return
     if not OPENROUTER_API_KEY:
         yield "OpenRouter API key missing — set OPENROUTER_API_KEY."
         return
@@ -3366,7 +3393,8 @@ def _apply_voice_language_directive_to_ctx(ctx: dict, text: str) -> dict[str, An
 
 
 def _voice_language_response_meta(ctx: dict) -> dict[str, Any]:
-    meta: dict[str, Any] = {"voice_language": str(ctx.get("voice_language", "") or "")}
+    meta: dict[str, Any] = {"voice_language": str(ctx.get("voice_language", "") or ""),
+                            "tts_mode": "browser" if AI_CONFIG.demo else "server"}
     if ctx.get("voice_language_persist"):
         meta["voice_language_persist"] = str(ctx.get("voice_language_persist") or "")
     if ctx.get("reply_language_persist"):
@@ -10528,7 +10556,7 @@ Update the saved profile instead of overwriting randomly. Keep only durable tuto
         *,
         visual_only: bool = False,
     ) -> bool:
-        if not OPENAI_API_KEY or not self.current_session_id:
+        if AI_CONFIG.blocks_paid or not OPENAI_API_KEY or not self.current_session_id:
             return False
         if self._is_3d_model_request(user_msg):
             return False
@@ -12107,6 +12135,8 @@ Update the saved profile instead of overwriting randomly. Keep only durable tuto
 
     def _maybe_auto_teaching_illustration(self, user_msg: str, response_text: str) -> str:
         """Append extra illustrations only in narrow cases — not after every teaching reply."""
+        if AI_CONFIG.blocks_paid:
+            return response_text
         cleaned_text, visual_blocks = _extract_all_visual_blocks(response_text)
         base_text = (cleaned_text or response_text or "").strip()
         existing_visuals = [
@@ -12563,6 +12593,9 @@ Quality rules:
 
     async def _alex_resolve_chat_model(self, user_msg: str, user_id: int) -> tuple[str, str, dict[str, Any]]:
         """Return (openrouter_model_id, teaching_mode core|r1, route_dict)."""
+        if AI_CONFIG.uses_groq:
+            route = dict(alex_routing.DEFAULT_ROUTE, provider="groq")
+            return AI_CONFIG.text_model, "core", route
         if not _openrouter_llm_ready():
             r = dict(alex_routing.DEFAULT_ROUTE)
             m, mode = self._alex_apply_route_to_chat(r, user_id)
@@ -14787,7 +14820,7 @@ Course units to cover:\n{courses_text}"""
             return
 
         if not _openrouter_llm_ready():
-            self.chat_history.append({"role": "assistant", **self._assistant_content_meta("API key missing — set OPENROUTER_API_KEY in env.")})
+            self.chat_history.append({"role": "assistant", **self._assistant_content_meta("AI is not configured — set GROQ_API_KEY for demo mode or OPENROUTER_API_KEY for OpenRouter.")})
             self.is_processing = False
             alex_routing.log_request(
                 {
@@ -15059,6 +15092,7 @@ Course units to cover:\n{courses_text}"""
             not has_image_attached
             and not has_document_attached
             and OPENAI_API_KEY
+            and not AI_CONFIG.blocks_paid
             and _wants_real_image
         ):
             if not self.current_session_id:
@@ -36002,6 +36036,10 @@ class VideoState(AppState):
     @rx.event(background=True)
     async def submit_video(self):
         async with self:
+            if AI_CONFIG.blocks_paid:
+                self.video_status = "error"
+                self.video_error = "Live AI video generation is disabled in free demo mode."
+                return
             if not self.video_can_submit:
                 return
             if not ALEX_VIDEO_SERVICE_URL:
@@ -38024,9 +38062,9 @@ async def alex_voice_stt(request: Request):
     st_uid = _voice_request_uid(request)
     if st_uid < 0:
         return JSONResponse({"error": "Unauthorized", "text": ""}, status_code=401)
-    if not OPENAI_API_KEY:
+    if not (AI_CONFIG.api_key if AI_CONFIG.uses_groq else OPENAI_API_KEY):
         return JSONResponse(
-            {"error": "OPENAI_API_KEY missing (required for voice transcription)", "text": ""},
+            {"error": "GROQ_API_KEY missing (required for demo transcription)" if AI_CONFIG.uses_groq else "OPENAI_API_KEY missing (required for voice transcription)", "text": ""},
             status_code=503,
         )
 
@@ -38034,13 +38072,26 @@ async def alex_voice_stt(request: Request):
     audio_bytes = await request.body()
     if not audio_bytes or len(audio_bytes) < 40:
         return JSONResponse({"text": ""})
+    if len(audio_bytes) > 5 * 1024 * 1024:
+        return JSONResponse({"text": "", "error": "Recording too large. Please use a shorter clip."}, status_code=413)
+    try:
+        filename, upload_mime = ai_provider.audio_upload(content_type)
+    except ValueError as exc:
+        return JSONResponse({"text": "", "error": str(exc)}, status_code=415)
+    if AI_CONFIG.uses_groq:
+        try:
+            text = await ai_provider.transcribe(AI_CONFIG, audio_bytes, content_type)
+            return JSONResponse({"text": text})
+        except Exception:
+            logger.warning("Groq transcription failed; no provider fallback used")
+            return JSONResponse({"text": "", "error": ai_provider.DEMO_ERROR}, status_code=502)
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
             resp = await http.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                files={"file": ("audio.webm", audio_bytes, content_type or "audio/webm")},
+                files={"file": (filename, audio_bytes, upload_mime)},
                 data={"model": OPENAI_STT_MODEL, "response_format": "json"},
             )
             if resp.status_code == 200:
@@ -38067,7 +38118,7 @@ def _alex_voice_trim_history(ctx: dict, history: list) -> list:
 
 async def _alex_fish_tts_wav_bytes(text: str) -> bytes | None:
     """Synthesize WAV via Fish Audio (default voice: Sol). Returns None if not configured or on error."""
-    if not FISH_AUDIO_API_KEY:
+    if AI_CONFIG.blocks_paid or not FISH_AUDIO_API_KEY:
         return None
     t = (text or "").strip()
     if not t:
@@ -38103,6 +38154,8 @@ async def _alex_fish_tts_wav_bytes(text: str) -> bytes | None:
 
 async def _alex_voice_tts_audio_b64(text: str) -> str:
     """WAV base64 for Alex replies: Fish Audio first (Sol if default ref), else OpenAI when OPENAI_API_KEY is set."""
+    if AI_CONFIG.demo:
+        return ""
     fish_raw = await _alex_fish_tts_wav_bytes(text)
     if fish_raw:
         return base64.b64encode(fish_raw).decode()
@@ -38353,9 +38406,9 @@ async def alex_voice_api(request: Request):
             status_code=403,
         )
 
-    if not OPENROUTER_API_KEY:
+    if not _openrouter_llm_ready():
         return JSONResponse(
-            {"error": "OPENROUTER_API_KEY missing.", "text": "", "display_html": "", "audio_b64": ""},
+            {"error": "AI provider key missing. Configure GROQ_API_KEY for demo mode.", "text": "", "display_html": "", "audio_b64": ""},
             status_code=503,
         )
 
@@ -38479,8 +38532,8 @@ async def alex_voice_stream(request: Request):
     if int(ctx.get("uid", -1)) != v_uid:
         return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-    if not OPENROUTER_API_KEY:
-        return JSONResponse({"error": "OPENROUTER_API_KEY missing."}, status_code=503)
+    if not _openrouter_llm_ready():
+        return JSONResponse({"error": "AI provider key missing. Configure GROQ_API_KEY for demo mode."}, status_code=503)
 
     if not silence_nudge:
         _apply_voice_language_directive_to_ctx(ctx, transcript)
@@ -38767,6 +38820,7 @@ async def alex_voice_intro(request: Request):
             "display_html": intro_html,
             "speech_text": speech_text,
             "audio_b64": audio_b64,
+            **_voice_language_response_meta(ctx or {}),
         }
     )
 
@@ -38859,7 +38913,7 @@ async def alex_voice_sync(request: Request):
         _add_voice_seconds_today(int(uid), duration_seconds)
 
     # Background: update scope memory with voice session transcript
-    if OPENROUTER_API_KEY and ctx.get("scope"):
+    if _openrouter_llm_ready() and ctx.get("scope"):
         async def _update_voice_scope_memory():
             try:
                 uid_ = ctx["uid"]

@@ -693,6 +693,8 @@ async def generate_scene_code(
     """Returns (narration_text, manim_code) — composed from templates."""
     validate_topic(topic)
 
+    if os.getenv("ALEX_DEMO_FREE_MODE", "false").strip().lower() in ("true", "1", "yes"):
+        raise GenerationError("Live AI video generation is disabled in free demo mode")
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise GenerationError("OPENROUTER_API_KEY is not set")

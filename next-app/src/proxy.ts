@@ -146,7 +146,10 @@ export async function proxy(req: NextRequest) {
       body:
         req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
       redirect: "manual",
-      signal: AbortSignal.timeout(30_000),
+      // Groq STT/text have a 35s backend inactivity timeout. Allow 45s here;
+      // SSE gets a bounded 90s lifetime so an active response body is not cut at 30s.
+      signal: AbortSignal.timeout(pathname === "/api/alex-voice-stream" ? 90_000 :
+        pathname.startsWith("/api/alex-voice") ? 45_000 : 30_000),
       // @ts-expect-error: Node fetch supports duplex for streaming
       duplex: "half",
     });
