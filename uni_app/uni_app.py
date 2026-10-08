@@ -37193,20 +37193,9 @@ app = rx.App(
         # contains Radix Themes) caused the persistent FOUC where the welcome
         # card rendered top-left with green buttons. The bundled stylesheet alone
         # is sufficient.
-        # Keep <body> hidden until our splash script flips html.__app_ready=true.
-        # Reflex/emotion injects per-component styles AS each component renders,
-        # so the very first paint can show buttons/layout without their inline
-        # styles applied (e.g. white→green button, uncentered card).
-        rx.el.style(
-            "html:not(.__app_ready) body{visibility:hidden!important}"
-            "html.__app_ready body{visibility:visible!important}"
-            # Splash overlay & loading bar are siblings INSIDE body (not on <html>)
-            # because hydrateRoot(document) treats unexpected children of <html>
-            # as a hydration mismatch and re-renders the entire tree from scratch
-            # — losing the inline emotion styles in the process.
-            "html:not(.__app_ready) body>#__uni_sp,"
-            "html:not(.__app_ready) body>#__uni_tb{visibility:visible!important}"
-        ),
+        # The opaque splash already covers unstyled first paint. Never hide the
+        # whole document: Safari can suspend animation frames or React can reset
+        # the readiness class, hiding even the connection gate and Retry control.
         # Keep Reflex/Radix default controls out of the bright blue accent family.
         rx.el.style(_PREMIUM_UI_ACCENT_CSS),
         # Hide Reflex' raw websocket failure UI; reconnects continue silently.
@@ -37215,11 +37204,9 @@ app = rx.App(
         # Landing-page "Try Alex" demo widget — needs head-level so it executes pre-hydration.
         rx.el.script(ALEX_DEMO_WIDGET_JS),
         # Native loading splash — runs before React.
-        # Splash is mounted on <html> (NOT body) so it stays visible while the
-        # body-hiding rule above gates content. We wait for the DOM to stabilise
-        # (200ms with no mutations) AND then add an extra paint-frame delay so
-        # emotion CSS has finished injecting per-component styles, then flip the
-        # __app_ready class so the body fades into view.
+        # The existing body-mounted overlay covers first paint while styles
+        # settle. Its bounded timer fallback must work without animation frames;
+        # the underlying document and connection recovery UI remain visible.
         rx.el.script("""
 (function(){
   var CSS='@keyframes __ubr{0%{transform:translateX(-100%)}50%{transform:translateX(0)}100%{transform:translateX(100%)}}'+
@@ -37289,7 +37276,11 @@ app = rx.App(
         if(triggered) return;
         triggered=true;
         clearTimeout(pollTimer);
-        requestAnimationFrame(function(){requestAnimationFrame(remove);});
+        // A reveal must complete even when Safari suspends animation frames.
+        var revealFallback = setTimeout(remove, 120);
+        requestAnimationFrame(function(){requestAnimationFrame(function(){
+          clearTimeout(revealFallback); remove();
+        });});
       }
       // Hook every CSS-rule API emotion (and Radix) might use. Each call
       // bumps lastCssActivity. Hooks run on the prototype so they catch
