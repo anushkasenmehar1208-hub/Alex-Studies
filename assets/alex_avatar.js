@@ -109,7 +109,7 @@
       if (speechActive) {
         if (t >= nextMouth && t >= mouthPauseUntil) {
           if (t > boundaryUntil) mouthShape = ['AH', 'OH', 'CH'][Math.floor(random() * 3)];
-          mouthAt = t; mouthDuration = range(0.10, 0.19); mouthAmp = range(0.10, 0.28);
+          mouthAt = t; mouthDuration = range(0.10, 0.19); mouthAmp = range(0.14, 0.40);
           nextMouth = t + mouthDuration + range(0.07, 0.20);
           if (random() < 0.18) { mouthPauseUntil = t + range(0.20, 0.40); mouthAmp = 0; }
         }
