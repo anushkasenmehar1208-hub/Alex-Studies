@@ -15782,7 +15782,7 @@ Your response style rules:
                             reasoning_m=OPENROUTER_REASONING_MODEL,
                             premium_m=OPENROUTER_PREMIUM_MODEL,
                             route=route,
-                            premium_budget_allows=alex_routing.can_use_premium(uid),
+                            premium_ok=alex_routing.can_use_premium(uid),
                         )
                         if nxt is not None and retries_used < alex_routing.MAX_QUALITY_RETRIES:
                             chat_model, or_teaching_mode = nxt
@@ -15831,7 +15831,7 @@ Your response style rules:
                             reasoning_m=OPENROUTER_REASONING_MODEL,
                             premium_m=OPENROUTER_PREMIUM_MODEL,
                             route=route,
-                            premium_budget_allows=alex_routing.can_use_premium(uid),
+                            premium_ok=alex_routing.can_use_premium(uid),
                         )
                     if nxt is None:
                         break
@@ -16339,7 +16339,7 @@ Behavior rules:
                     reasoning_m=OPENROUTER_REASONING_MODEL,
                     premium_m=OPENROUTER_PREMIUM_MODEL,
                     route=route,
-                    premium_budget_allows=alex_routing.can_use_premium(uid),
+                    premium_ok=alex_routing.can_use_premium(uid),
                 )
                 if nxt_h is not None and retries_used_h < alex_routing.MAX_QUALITY_RETRIES:
                     chat_model, or_teaching_mode = nxt_h
@@ -16388,7 +16388,7 @@ Behavior rules:
                     reasoning_m=OPENROUTER_REASONING_MODEL,
                     premium_m=OPENROUTER_PREMIUM_MODEL,
                     route=route,
-                    premium_budget_allows=alex_routing.can_use_premium(uid),
+                    premium_ok=alex_routing.can_use_premium(uid),
                 )
             if nxt_h is None:
                 break

@@ -67,6 +67,21 @@ def request(body, content_type="application/json"):
 
 
 class DemoProviderTests(unittest.TestCase):
+    def test_chat_escalation_calls_match_router_interface_and_block_demo_retries(self):
+        from uni_app import alex_routing
+        import inspect
+        tree = ast.parse((ROOT / "uni_app/uni_app.py").read_text())
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == "next_escalation"]
+        self.assertTrue(calls)
+        values = {"teacher_m": "teacher", "reasoning_m": "reasoning", "premium_m": "premium",
+                  "route": {}, "premium_ok": False}
+        with patch.object(alex_routing, "AI_CONFIG", DEMO):
+            for call in calls:
+                kwargs = {keyword.arg: values.get(keyword.arg) for keyword in call.keywords}
+                inspect.signature(alex_routing.next_escalation).bind("groq-model", **kwargs)
+                self.assertIsNone(alex_routing.next_escalation("groq-model", **kwargs))
+
     def test_selection_is_reversible_and_demo_forces_groq(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(ai_provider.ProviderConfig.from_env().provider, "openrouter")
