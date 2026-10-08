@@ -5344,7 +5344,7 @@ class DayProgress(rx.Model, table=True):  # type: ignore
 
 
 def _app_shell_loading_gate(message: str = "Loading workspace...") -> rx.Component:
-    """Full-screen splash with a top progress bar. Covers the blank body during WebSocket hydration."""
+    """Visible connection gate; Retry works locally even before the socket hydrates."""
     return rx.box(
         rx.el.style("""
             @keyframes alex-topbar-slide {
@@ -5372,8 +5372,25 @@ def _app_shell_loading_gate(message: str = "Loading workspace...") -> rx.Compone
                 box-shadow: 0 0 12px rgba(255,255,255,0.28);
             }
         """),
-        # Top progress bar only — no text, just the bar on dark background
         rx.box(rx.box(class_name="alex-topbar-fill"), class_name="alex-topbar-track"),
+        rx.html("""
+            <style>
+              .alex-connection-card { position:absolute; top:45%; left:50%; transform:translate(-50%,-50%); width:min(90vw,360px); text-align:center; color:#eef0f4; font-family:system-ui,sans-serif; }
+              .alex-connection-card p { font-size:16px; margin:0 0 14px; }
+              .alex-connection-slow { visibility:hidden; opacity:0; animation:alex-connect-slow 0.2s ease 15s forwards; }
+              .alex-connection-card button { margin-top:12px; padding:10px 24px; border:1px solid #60636d; border-radius:10px; background:#252730; color:#eef0f4; font-size:14px; cursor:pointer; }
+              .alex-connection-card button:focus-visible { outline:2px solid #86efac; outline-offset:3px; }
+              @keyframes alex-connect-slow { to { visibility:visible; opacity:1; } }
+              @media(prefers-reduced-motion:reduce) { .alex-topbar-fill { animation:none; transform:none; } }
+            </style>
+            <div class="alex-connection-card" role="status" aria-live="polite">
+              <p>Connecting to AlexStudies…</p>
+              <div class="alex-connection-slow">
+                <p>Still connecting…</p>
+                <button type="button" onclick="window.location.reload()">Retry</button>
+              </div>
+            </div>
+        """),
         position="fixed",
         top="0", left="0", right="0", bottom="0",
         background="#0a0a0c",

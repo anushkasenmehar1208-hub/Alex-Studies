@@ -20,7 +20,7 @@ function load(available = true) {
     document: {documentElement: {lang: 'en'}},
     browserUtterance: null, browserSpeechTimer: null, processing: false,
     active: true, callGeneration: 1, playbackGeneration: 0, pauseMicrophone() {},
-    startBargeInMonitor() {}, stopBargeInMonitor() {}, setMicTracksEnabled() {},
+    notifyAvatar() {}, startBargeInMonitor() {}, stopBargeInMonitor() {}, setMicTracksEnabled() {},
     isCurrentCall: generation => generation === 1,
     setTimeout: () => 1, clearTimeout() {}, setStatus() {}, setOrbState() {},
     appendVoiceServerNotice: text => notices.push(text),

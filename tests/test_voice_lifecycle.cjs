@@ -80,7 +80,10 @@ function browser(options = {}) {
       return node;
     }
   }
+  const avatarEvents = [];
   const window = {
+    CustomEvent: function(type, opts) {this.type=type; this.detail=opts.detail;},
+    dispatchEvent(event) {if(event.type==='alex-avatar-voice') avatarEvents.push(event.detail);},
     AudioContext, MediaRecorder: Recorder, innerWidth: 1280, location: {pathname: '/s/home'},
     ALEX_VOICE_ALLOWED: true, ALEX_VOICE_SHOW_UPSELL: false, ALEX_VOICE_KEY: 'test-session',
     ALEX_AUTH_STORAGE_KEY: '_auth_token',
@@ -143,7 +146,7 @@ function browser(options = {}) {
     now = until;
     await flush();
   }
-  return {window, context, elements, calls, recorders, streams, spoken, contexts, timers, intro,
+  return {window, context, elements, calls, recorders, streams, spoken, contexts, timers, intro, avatarEvents,
     json, stream, advance, energy: value => { energy = value; },
     status: () => elements['alex-status'].textContent,
     start: async () => { const started = window.toggleAlexVoice(); await flush(); await started; await flush(); },
@@ -514,4 +517,25 @@ test('manual mute disables interruption monitoring and unmute restores it during
   b.energy(35); await b.advance(225);
   assert.equal(b.cancelled(), cancels + 1);
   b.window.stopAlexVoiceSession();
+});
+
+
+test('avatar speech events follow actual utterance start/boundaries and cancel immediately on barge-in', async () => {
+  const b=browser(); await b.start();
+  assert.ok(b.avatarEvents.some(e=>e.type==='state' && e.state==='listening'));
+  b.energy(35); await b.advance(300); b.energy(0); await b.advance(450);
+  const u=b.spoken[0];
+  assert.equal(b.avatarEvents.filter(e=>e.type==='speech-start').length,0);
+  u.onstart(); u.onboundary({charIndex:0});
+  assert.ok(b.avatarEvents.some(e=>e.type==='speech-start'));
+  assert.ok(b.avatarEvents.some(e=>e.type==='speech-boundary' && e.word==='Plants'));
+  const staleBoundary=u.onboundary;
+  await b.advance(300); b.energy(35); await b.advance(225);
+  assert.equal(u.onboundary,null);
+  assert.ok(b.avatarEvents.some(e=>e.type==='interrupted'));
+  assert.equal(b.avatarEvents.at(-1).state,'listening');
+  const count=b.avatarEvents.length; staleBoundary({charIndex:5});
+  assert.equal(b.avatarEvents.length,count);
+  b.window.stopAlexVoiceSession();
+  assert.ok(b.avatarEvents.slice(count).some(e=>e.type==='speech-cancel'));
 });

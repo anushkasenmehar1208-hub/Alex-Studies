@@ -29,6 +29,15 @@
       }) : []
     });
   };
+  function notifyAvatar(type, details) {
+    var event = Object.assign({type: type}, details || {});
+    if (type !== 'speech-boundary') window.__alexAvatarVoiceEvent = event;
+    try {
+      if (window.dispatchEvent && window.CustomEvent) {
+        window.dispatchEvent(new window.CustomEvent('alex-avatar-voice', {detail: event}));
+      }
+    } catch (eAvatar) { /* Animation must never affect a call. */ }
+  }
   var callGeneration = 0;
   var callAbort = null;
   var callButton = null;
@@ -153,9 +162,11 @@
   function stopAlexPlaybackEngine() {
     stopBargeInMonitor();
     playbackGeneration++;
+    notifyAvatar('speech-cancel');
     if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
     browserSpeechTimer = null;
     if (browserUtterance) {
+      browserUtterance.onboundary = null;
       browserUtterance.onstart = null;
       browserUtterance.onend = null;
       browserUtterance.onerror = null;
@@ -259,11 +270,13 @@
       if (finished) return;
       finished = true;
       if (!isCurrentCall(generation) || playback !== playbackGeneration) return;
+      notifyAvatar('speech-end');
       stopBargeInMonitor();
       setMicTracksEnabled(false);
       if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
       browserSpeechTimer = null;
       if (browserUtterance) {
+        browserUtterance.onboundary = null;
         browserUtterance.onstart = null;
         browserUtterance.onend = null;
         browserUtterance.onerror = null;
@@ -301,7 +314,15 @@
         finish(true);
       }, 60000);
       utterance.onstart = function () {
-        if (isCurrentCall(generation) && playback === playbackGeneration && browserUtterance === utterance) startBargeInMonitor();
+        if (isCurrentCall(generation) && playback === playbackGeneration && browserUtterance === utterance) {
+          notifyAvatar('speech-start');
+          startBargeInMonitor();
+        }
+      };
+      utterance.onboundary = function (event) {
+        if (!isCurrentCall(generation) || playback !== playbackGeneration || browserUtterance !== utterance) return;
+        var word = utterance.text.slice(event.charIndex || 0).split(/\s+/)[0];
+        notifyAvatar('speech-boundary', {word: word.slice(0, 80)});
       };
       window.speechSynthesis.speak(utterance);
       startBargeInMonitor();
@@ -747,6 +768,9 @@
   function setStatus(msg) {
     var el = document.getElementById('alex-status');
     if (el) el.textContent = msg;
+    if (msg === 'Listening…') notifyAvatar('state', {state: 'listening'});
+    else if (msg === 'Thinking…') notifyAvatar('state', {state: 'thinking'});
+    else if (msg === 'Muted') notifyAvatar('state', {state: 'idle'});
   }
 
   function setTranscript(msg) {
@@ -903,6 +927,7 @@
     var orb = document.getElementById('alex-orb');
     if (!orb) return;
     orb.className = state;
+    notifyAvatar('state', {state: state === 'ai-speaking' ? 'speaking' : state === 'user-speaking' ? 'listening' : state});
   }
 
   // ── Toggle ──────────────────────────────────────────────────
@@ -1205,6 +1230,7 @@
       if (rms < threshold) { sustained = 0; return; }
       if (!sustained) sustained = now;
       if (now - sustained < BARGE_IN_SUSTAIN_MS) return;
+      notifyAvatar('interrupted');
       traceVoice('barge-in', { rms: Number(rms.toFixed(2)), threshold: Number(threshold.toFixed(2)) });
       // Invalidate every old utterance/timer before cancel(), which may fire onerror.
       disposeCurrentPlayback();

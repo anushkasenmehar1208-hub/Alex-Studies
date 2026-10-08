@@ -10,6 +10,124 @@
 (function () {
   'use strict';
 
+  // One timer-free controller, advanced exclusively by the existing render loop.
+  // It owns additive pose/morph deltas; voice owns all recording and playback.
+  function createAvatarMotion(rig, random) {
+    random = random || Math.random;
+    var alive = true, t = 0, state = 'idle', entered = 0;
+    var nextBlink = range(3, 7), blinkAt = -10, blinkDuration = 0.14, doublePending = false;
+    var breathAt = 0, breathDuration = range(4, 6), breathAmp = range(0.003, 0.006);
+    var nextHead = 0, head = {x: 0, y: 0, z: 0}, target = {x: 0, y: 0, z: 0};
+    var nextNod = range(4, 8), nodAt = -10, glanceUntil = 0;
+    var speechActive = false, nextMouth = 0, mouthAt = -10, mouthDuration = 0.15;
+    var mouthShape = 'AH', mouthAmp = 0, mouthPauseUntil = 0, boundaryUntil = 0;
+    var morphs = {};
+    rig.morphMeshes.forEach(function (mesh) {
+      Object.keys(mesh.morphTargetDictionary).forEach(function (name) {
+        if (!morphs[name]) morphs[name] = [];
+        morphs[name].push({mesh: mesh, index: mesh.morphTargetDictionary[name]});
+      });
+    });
+    function range(a, b) { return a + (b - a) * random(); }
+    function smooth(x) { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); }
+    function pulse(at, duration) {
+      var phase = (t - at) / duration;
+      return phase < 0 || phase > 1 ? 0 : smooth(phase < 0.45 ? phase / 0.45 : (1 - phase) / 0.55);
+    }
+    function morph(name, value) {
+      (morphs[name] || []).forEach(function (binding) { binding.mesh.morphTargetInfluences[binding.index] = value; });
+    }
+    function clearMouthWeights() {
+      ['AH', 'OH', 'CH', 'jawOpen', 'mouthOpen', 'viseme_aa', 'viseme_O', 'viseme_E', 'viseme_U'].forEach(function (name) { morph(name, 0); });
+    }
+    function closeMouth() { mouthAmp = 0; mouthAt = -10; clearMouthWeights(); }
+    function setState(value) {
+      if (!alive || state === value) return;
+      state = value; entered = t; nextHead = t;
+      nextNod = t + range(2, 5);
+      glanceUntil = value === 'thinking' && random() < 0.4 ? t + range(0.6, 1.1) : 0;
+      if (value !== 'speaking') { speechActive = false; closeMouth(); }
+    }
+    function speech(event) {
+      if (!alive) return;
+      if (event.type === 'state') { setState(event.state); return; }
+      if (event.type === 'speech-start') {
+        setState('speaking'); speechActive = true; nextMouth = t; mouthPauseUntil = 0; return;
+      }
+      if (event.type === 'speech-boundary' && speechActive) {
+        var word = event.word || '';
+        mouthShape = /[ou]/i.test(word) ? 'OH' : /[csjt]/i.test(word) ? 'CH' : 'AH';
+        nextMouth = t; boundaryUntil = t + 0.3;
+        if (/[.!?,;:]$/.test(word)) mouthPauseUntil = t + range(0.18, 0.32);
+        // Sparse phrase emphasis, never an animation on every word.
+        if (t >= nextNod && random() < 0.25) { nodAt = t; nextNod = t + range(4, 8); }
+        return;
+      }
+      if (event.type === 'speech-end' || event.type === 'speech-cancel') {
+        speechActive = false; closeMouth(); setState('idle');
+      }
+      if (event.type === 'interrupted') { speechActive = false; closeMouth(); setState('interrupted'); }
+    }
+    function applyBone(key, x, y, z, k) {
+      var bone = key === 'head' ? rig.head : rig.bones[key], rest = rig.rest[key];
+      if (!bone || !rest) return;
+      bone.rotation.x += (rest.x + x - bone.rotation.x) * k;
+      bone.rotation.y += (rest.y + y - bone.rotation.y) * k;
+      bone.rotation.z += (rest.z + z - bone.rotation.z) * k;
+    }
+    function update(dt, audioLevel) {
+      if (!alive) return;
+      dt = Math.min(0.05, Math.max(0, dt)); t += dt;
+      if (t >= nextBlink) {
+        blinkAt = t; blinkDuration = range(0.10, 0.18);
+        if (!doublePending && random() < 0.06) { doublePending = true; nextBlink = t + blinkDuration + 0.12; }
+        else { doublePending = false; nextBlink = t + range(3, 7); }
+      }
+      morph('eye_close', pulse(blinkAt, blinkDuration));
+      if (t - breathAt >= breathDuration) { breathAt = t; breathDuration = range(4, 6); breathAmp = range(0.003, 0.006); }
+      var breath = Math.sin((t - breathAt) / breathDuration * Math.PI * 2) * breathAmp;
+      // No whole-body vertical bob: torso/shoulders carry quiet breathing.
+      if (rig.root) rig.root.position.y = rig.restY;
+      if (t >= nextHead) {
+        var neutral = random() < 0.25;
+        target = {x: neutral ? 0 : range(-0.018, 0.018), y: neutral ? 0 : range(-0.025, 0.025), z: neutral ? 0 : range(-0.012, 0.012)};
+        nextHead = t + range(2.5, 6);
+      }
+      var k = 1 - Math.exp(-dt * 2.5);
+      ['x', 'y', 'z'].forEach(function (axis) { head[axis] += (target[axis] - head[axis]) * k; });
+      if ((state === 'listening' || state === 'speaking') && t >= nextNod) { nodAt = t; nextNod = t + range(5, 10); }
+      var nod = pulse(nodAt, 0.85) * 0.018;
+      var attention = state === 'listening' ? 0.012 : 0;
+      applyBone('head', head.x - nod - attention, head.y, head.z + attention, k);
+      applyBone('neck', breath * 0.25, 0, attention * 0.25, k);
+      applyBone('spine', breath, 0, 0, k);
+      applyBone('spine1', breath * 0.5, 0, 0, k);
+      ['leftShoulder', 'rightShoulder'].forEach(function (key) { applyBone(key, breath * 0.4, 0, 0, k); });
+      ['leftArm', 'rightArm', 'leftForeArm', 'rightForeArm', 'leftHand', 'rightHand'].forEach(function (key) { applyBone(key, 0, 0, 0, k); });
+      morph('eyesLookUp', t < glanceUntil ? Math.sin(Math.PI * (t - entered) / (glanceUntil - entered)) * 0.10 : 0);
+      clearMouthWeights();
+      if (speechActive) {
+        if (t >= nextMouth && t >= mouthPauseUntil) {
+          if (t > boundaryUntil) mouthShape = ['AH', 'OH', 'CH'][Math.floor(random() * 3)];
+          mouthAt = t; mouthDuration = range(0.10, 0.19); mouthAmp = range(0.10, 0.28);
+          nextMouth = t + mouthDuration + range(0.07, 0.20);
+          if (random() < 0.18) { mouthPauseUntil = t + range(0.20, 0.40); mouthAmp = 0; }
+        }
+        var amount = pulse(mouthAt, mouthDuration) * mouthAmp;
+        morph(mouthShape, amount);
+        // Preserve the optional server-audio path on models with Oculus/ARKit shapes.
+      } else if (state === 'speaking') {
+        var amount = Math.min(0.28, (audioLevel || 0) * 0.4);
+        if (morphs.AH) morph('AH', amount);
+        else if (morphs.jawOpen) morph('jawOpen', amount);
+        else morph('viseme_aa', amount);
+      }
+    }
+    return {update: update, setState: setState, speech: speech,
+      dispose: function () { if (!alive) return; closeMouth(); morph('eye_close', 0); morph('eyesLookUp', 0); alive = false; },
+      snapshot: function () { return {state: state, alive: alive, time: t, nextBlink: nextBlink, blinkDuration: blinkDuration, speechActive: speechActive}; }};
+  }
+
   // ── Config ─────────────────────────────────────────────────────────────────
   // Resolve default avatar URL relative to THIS script's location so the same file
   // works both inside the Reflex app (/alex_avatar.js → /models/…) and when the
@@ -324,7 +442,7 @@
     var obsTargetId = window.ALEX_AVATAR_TARGET_ID || 'alex-orb';
     var docObs = new MutationObserver(function () {
       var orb = document.getElementById(obsTargetId);
-      if (!orb) return;
+      if (!orb || document.hidden) return;
       var canvasId = obsTargetId + '-avatar-canvas';
       // Only act when the orb exists but canvas is absent (fresh mount).
       if (!document.getElementById(canvasId)) {
@@ -333,10 +451,16 @@
       }
     });
     docObs.observe(document.documentElement, { childList: true, subtree: true });
+    window.addEventListener('pagehide', function () { docObs.disconnect(); });
+    window.addEventListener('pageshow', function () {
+      docObs.observe(document.documentElement, { childList: true, subtree: true });
+      bootDefaultAvatar();
+    });
   })();
 
   function initScene(mods, canvas, orb, targetId) {
     targetId = targetId || 'alex-orb';
+    if (!canvas.isConnected) return;
     var THREE = mods.THREE;
     var GLTFLoader = mods.GLTFLoader;
     var DRACOLoader = mods.DRACOLoader;
@@ -462,7 +586,49 @@
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
     }
+    var disposed = false, stateObserver = null, motion = null;
+    function disposeObject(root) {
+      if (!root) return;
+      var resources = new Set();
+      root.traverse(function (node) {
+        if (node.geometry) resources.add(node.geometry);
+        var materials = node.material ? (Array.isArray(node.material) ? node.material : [node.material]) : [];
+        materials.forEach(function (material) {
+          resources.add(material);
+          Object.keys(material).forEach(function (key) { if (material[key] && material[key].isTexture) resources.add(material[key]); });
+        });
+      });
+      resources.forEach(function (resource) { resource.dispose(); });
+    }
+    function onVoiceMotion(event) { if (motion) motion.speech(event.detail || {}); }
+    function cleanupScene() {
+      if (disposed) return;
+      disposed = true;
+      renderer.setAnimationLoop(null);
+      if (motion) motion.dispose();
+      if (stateObserver) stateObserver.disconnect();
+      removalObserver.disconnect();
+      window.removeEventListener('resize', sizeToCanvas);
+      window.removeEventListener('alex-avatar-voice', onVoiceMotion);
+      window.removeEventListener('pagehide', cleanupScene);
+      if (rig.controls) rig.controls.dispose();
+      if (window.AlexAvatar && window.AlexAvatar.__rig === rig) {
+        delete window.AlexAvatar.__rig; delete window.AlexAvatar.__camera; delete window.AlexAvatar.__controls;
+      }
+      disposeObject(scene);
+      Object.keys(teacherTextureCache).forEach(function (key) { teacherTextureCache[key].dispose(); });
+      renderer.dispose();
+      if (typeof draco !== 'undefined' && draco) draco.dispose();
+      if (typeof ktx2 !== 'undefined' && ktx2) ktx2.dispose();
+      delete window.__alexAvatarBootedTargets[targetId];
+      if (canvas.parentNode) canvas.remove();
+    }
+    var removalObserver = new MutationObserver(function () { if (!canvas.isConnected) cleanupScene(); });
+    removalObserver.observe(document.documentElement, {childList: true, subtree: true});
     window.addEventListener('resize', sizeToCanvas);
+    window.addEventListener('alex-avatar-voice', onVoiceMotion);
+    window.addEventListener('pagehide', cleanupScene);
+
 
     // Load avatar — try local GLB first, then remote fallback if local is missing.
     var loader = new GLTFLoader();
@@ -487,10 +653,11 @@
     }
 
     function loadWithFallback(urls, idx) {
+      if (disposed) return;
       idx = idx || 0;
       if (idx >= urls.length) {
         warn('All GLB sources failed — keeping orb fallback.');
-        try { canvas.remove(); } catch (e) {}
+        cleanupScene();
         return;
       }
       var url = urls[idx];
@@ -503,6 +670,7 @@
 
     function onLoaded(gltf) {
       var avatar = gltf.scene;
+      if (disposed) { disposeObject(avatar); return; }
       function isEyeNodeName(name) {
         var nm = (name || '').toLowerCase();
         if (!nm) return false;
@@ -1196,7 +1364,9 @@
       canvas.classList.add('alex-avatar-ready');
       orb.classList.add('alex-avatar-active');
 
+      motion = createAvatarMotion(rig);
       startObservers();
+      if (window.__alexAvatarVoiceEvent) motion.speech(window.__alexAvatarVoiceEvent);
       startLoop();
     }
 
@@ -1208,181 +1378,30 @@
     loadWithFallback(urls);
 
     function startObservers() {
-      rig.currentState = (orb.className || 'idle').trim().split(/\s+/)[0] || 'idle';
-      rig.targetState = rig.currentState;
-      rig.prevState = rig.currentState;
-      var obs = new MutationObserver(function () {
-        var cls = (orb.className || '').trim().split(/\s+/);
-        // Pick the first known state class.
-        var known = ['idle', 'ai-speaking', 'user-speaking', 'thinking'];
-        for (var i = 0; i < cls.length; i++) {
-          if (known.indexOf(cls[i]) !== -1) {
-            if (rig.targetState !== cls[i]) {
-              rig.prevState = rig.targetState;
-              rig.targetState = cls[i];
-              rig.stateEnteredAt = rig.t;
-            }
-            return;
-          }
+      function updateState() {
+        // Voice events are authoritative for the call orb, including quiet listening.
+        if (targetId === 'alex-orb' && window.__alex_voice_session_active && window.__alexAvatarVoiceEvent) {
+          return;
         }
-        rig.targetState = 'idle';
-      });
-      obs.observe(orb, { attributes: true, attributeFilter: ['class'] });
-    }
-
-    // ── Gesture helpers ───────────────────────────────────────────────────
-    // Each gesture function returns a DELTA euler {x,y,z} that gets ADDED to the
-    // rest rotation of the bone. Keeping them additive means transitions between
-    // gestures just blend with gravity-like smoothing (lerp below).
-    function zero() { return { x: 0, y: 0, z: 0 }; }
-
-    // How the loop applies gestures: we compute target-state per-bone deltas,
-    // then lerp the current applied delta toward them every frame. That gives
-    // smooth hand-off between idle/speaking/waving without the arms popping.
-    var applied = {
-      leftArm:      zero(), leftForeArm:  zero(), leftHand:  zero(),
-      rightArm:     zero(), rightForeArm: zero(), rightHand: zero(),
-      spine:        zero(), spine1:       zero(), neck: zero()
-    };
-    function lerpApply(key, tx, ty, tz, k) {
-      var a = applied[key];
-      a.x += (tx - a.x) * k;
-      a.y += (ty - a.y) * k;
-      a.z += (tz - a.z) * k;
-      var b = rig.bones[key];
-      var r = rig.rest[key];
-      if (b && r) b.rotation.set(r.x + a.x, r.y + a.y, r.z + a.z);
+        var classes = (orb.className || '').split(/\s+/);
+        var state = classes.indexOf('ai-speaking') !== -1 ? 'speaking' :
+          classes.indexOf('user-speaking') !== -1 ? 'listening' :
+          classes.indexOf('thinking') !== -1 ? 'thinking' : 'idle';
+        motion.setState(state);
+      }
+      updateState();
+      stateObserver = new MutationObserver(updateState);
+      stateObserver.observe(orb, {attributes: true, attributeFilter: ['class']});
     }
 
     var clock = new THREE.Clock();
     function startLoop() {
       renderer.setAnimationLoop(function () {
-        // If the canvas was removed from the DOM (Reflex closed the voice overlay),
-        // stop the render loop and clear the boot flag so the next open re-inits cleanly.
-        if (!canvas.isConnected) {
-          renderer.setAnimationLoop(null);
-          try { renderer.dispose(); } catch (e) {}
-          delete window.__alexAvatarBootedTargets[targetId];
-          log('canvas detached — render loop stopped, boot flag cleared');
-          return;
-        }
-
+        if (disposed || !canvas.isConnected) { cleanupScene(); return; }
         var dt = Math.min(0.05, clock.getDelta());
-        rig.t += dt;
-
-        // Idle breathing: subtle vertical bob + head sway.
-        if (rig.root) {
-          var breath = Math.sin(rig.t * 1.6) * 0.006;
-          rig.root.position.y = rig.restY + breath;
-        }
-        if (rig.head && rig.rest.head) {
-          // Apply head animation ADDITIVELY around the captured rest rotation.
-          // Overwriting .x/.y directly (as earlier revisions did) would discard
-          // the avatar's bind-pose head tilt and produce a broken-neck look.
-          var rh = rig.rest.head;
-          var swayY = Math.sin(rig.t * 0.6) * 0.04;       // subtle left/right head shake
-          var swayX = Math.sin(rig.t * 0.4 + 1.2) * 0.025; // very subtle up/down nod
-          var headDX = swayX;
-          var headDY = swayY;
-          var headDZ = 0;
-
-          if (rig.targetState === 'thinking') {
-            headDY = Math.sin(rig.t * 1.5) * 0.12;
-            headDX = -0.05 + Math.sin(rig.t * 2.3) * 0.04;
-          } else if (rig.targetState === 'user-speaking') {
-            // Listening: small attentive nod (slight chin-down + tiny oscillation).
-            headDX = -0.02 + Math.sin(rig.t * 0.9) * 0.02;
-            headDY = swayY * 0.5;
-          } else if (rig.targetState === 'ai-speaking') {
-            // Speaking: livelier movement, scaled with audio loudness.
-            var l = rig.loudness;
-            headDY = swayY + Math.sin(rig.t * 2.1) * 0.04 * l;
-            headDX = swayX + Math.sin(rig.t * 2.8) * 0.03 * l;
-          }
-          rig.head.rotation.x = rh.x + headDX;
-          rig.head.rotation.y = rh.y + headDY;
-          rig.head.rotation.z = rh.z + headDZ;
-        }
-
-        // ── Arm + torso gestures ────────────────────────────────────────────
-        // Compute target deltas per-bone for the current state.
-        var t = rig.t;
-        var tgt = {
-          leftArm: zero(), leftForeArm: zero(), leftHand: zero(),
-          rightArm: zero(), rightForeArm: zero(), rightHand: zero(),
-          spine: zero(), spine1: zero(), neck: zero()
-        };
-
-        // Gesture deltas are ADDITIVE to the rest rotation. All per-state deltas
-        // are intentionally TINY here — the RPM forearm/upper-arm bone axes are
-        // non-obvious (large X deltas produce elbow-out "akimbo" poses instead
-        // of natural forward arm swings), so we keep the arms at rest and let
-        // the torso + head carry the expressive motion. This reads as a calm,
-        // grounded presenter rather than a flailing cartoon.
-        if (rig.targetState === 'thinking') {
-          // Contemplative: head tilts + tiny neck adjustment, arms stay at rest.
-          tgt.neck      = { x:  0.03, y:  0.05, z:  0.00 };
-          tgt.spine     = { x:  0.00, y:  0.02, z:  0.00 };
-          // Very subtle shoulder "hold" — barely perceptible, keeps arms still.
-          tgt.leftArm   = { x:  0.00, y:  0.01, z:  0.00 };
-          tgt.rightArm  = { x:  0.00, y: -0.01, z:  0.00 };
-        } else if (rig.targetState === 'ai-speaking') {
-          // Speaking: torso + shoulder sway plus a gentle forearm "teaching
-          // gesture" — forearms breathe up and down subtly (small X delta),
-          // scaled with loudness, to mimic a standing presenter emphasising
-          // points with their hands. Magnitudes are tuned to stay BELOW the
-          // akimbo threshold (empirically ~0.7 delta on forearm X = elbow-out
-          // on this RPM rig; we stay at or under 0.30).
-          var l = rig.loudness;
-          var amp = 0.4 + 0.6 * l;                         // 0.4 silent → 1.0 peak
-          var swayYaw  = Math.sin(t * 0.9) * 0.05 * amp;   // torso yaw
-          var swayRoll = Math.sin(t * 1.4) * 0.02 * amp;   // shoulder rock
-          tgt.spine    = { x: 0.00, y: swayYaw,         z: swayRoll };
-          tgt.spine1   = { x: 0.00, y: swayYaw * 0.4,   z: swayRoll * 0.3 };
-          // Shoulder counter-sway (Y = gentle inward/outward) — keeps arms alive.
-          tgt.leftArm  = { x: 0.00, y:  0.03 * Math.sin(t * 1.1) * amp,       z: 0.00 };
-          tgt.rightArm = { x: 0.00, y: -0.03 * Math.sin(t * 1.1 + 0.4) * amp, z: 0.00 };
-          // "Hand talking" — forearm X breathes between rest and ~+0.25.
-          // Both forearms move together in a gentle rise-and-fall; the wrists
-          // end up hovering slightly forward, like a teacher framing an idea.
-          // Bias the range to positive only so we never curl BEHIND rest.
-          var handLift = (0.14 + 0.11 * Math.sin(t * 2.2)) * amp;     // 0.03 .. 0.25
-          var handLiftR = (0.14 + 0.11 * Math.sin(t * 2.2 + 0.6)) * amp;
-          tgt.leftForeArm  = { x: handLift,  y: 0.00, z: 0.00 };
-          tgt.rightForeArm = { x: handLiftR, y: 0.00, z: 0.00 };
-
-        } else if (rig.targetState === 'user-speaking') {
-          // Listening: small attentive spine sway + head nod handled above.
-          tgt.spine = { x: 0.00, y: 0.02 * Math.sin(t * 0.6), z: 0.00 };
-        } else {
-          // Idle — the breath bob (on rig.root.position.y) does most of the
-          // work. Arms get a barely-there Y drift so they don't look frozen.
-          tgt.leftArm  = { x: 0.00, y:  0.015 * Math.sin(t * 0.55),       z: 0.00 };
-          tgt.rightArm = { x: 0.00, y: -0.015 * Math.sin(t * 0.55 + 0.3), z: 0.00 };
-        }
-
-        // Smooth-apply every bone delta.
-        var k = Math.min(1, dt * 6.0);        // ~6Hz follow rate
-        Object.keys(tgt).forEach(function (key) {
-          var v = tgt[key];
-          lerpApply(key, v.x, v.y, v.z, k);
-        });
-
-        // Lip-sync: drive jaw morph from loudness, but only while speaking.
-        var targetMouth = 0;
-        if (rig.targetState === 'ai-speaking') {
-          rig.loudness = rig.loudness * 0.55 + sampleLoudness() * 0.45;
-          targetMouth = Math.min(0.58, rig.loudness * 0.72);
-        } else {
-          rig.loudness *= 0.9;
-        }
-        for (var i = 0; i < rig.morphMeshes.length; i++) {
-          var m = rig.morphMeshes[i];
-          var idx = rig.viseme[m.uuid];
-          if (idx == null) continue;
-          var cur = m.morphTargetInfluences[idx] || 0;
-          m.morphTargetInfluences[idx] = cur + (targetMouth - cur) * 0.35;
-        }
+        var rect = canvas.getBoundingClientRect();
+        if (document.hidden || rect.width === 0 || rect.height === 0 || orb.getClientRects().length === 0) return;
+        motion.update(dt, sampleLoudness());
 
         if (rig.controls) {
           try { rig.controls.update(); } catch (e) {}
