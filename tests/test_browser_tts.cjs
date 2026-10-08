@@ -19,6 +19,8 @@ function load(available = true) {
     } : {},
     document: {documentElement: {lang: 'en'}},
     browserUtterance: null, browserSpeechTimer: null, processing: false,
+    active: true, callGeneration: 1, pauseMicrophone() {},
+    isCurrentCall: generation => generation === 1,
     setTimeout: () => 1, clearTimeout() {}, setStatus() {}, setOrbState() {},
     appendVoiceServerNotice: text => notices.push(text),
     done: () => { resumed++; },
@@ -69,7 +71,7 @@ test('closing playback cancels browser speech without scheduling another listen'
   const stop = source.slice(source.indexOf('  function stopAlexPlaybackEngine()'),
     source.indexOf('  /**\n   * Queue one WAV'));
   Object.assign(t.context, {alexStreamActiveAudio: null, alexAudioChain: null,
-    alexPendingSegments: 0, alexSseDone: false});
+    alexPendingSegments: 0, alexSseDone: false, playbackGeneration: 0, alexStreamObjectUrl: null});
   vm.runInContext(stop, t.context);
   t.context.stopAlexPlaybackEngine();
   assert.equal(cancelled, 1);

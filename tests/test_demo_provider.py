@@ -101,7 +101,7 @@ class DemoProviderTests(unittest.TestCase):
         self.assertFalse(ns["_openrouter_llm_ready"]())
         with patch.object(httpx, "Client", side_effect=AssertionError("No HTTP with missing key")):
             response = ns["_openrouter_complete"]("paid", [], 100)
-            self.assertIn("GROQ_API_KEY", response.text)
+            self.assertEqual(response.text, ai_provider.DEMO_ERROR)
         response = asyncio.run(ns["alex_voice_stt"](request(b"x" * 100)))
         self.assertEqual(response.status_code, 503)
 
@@ -110,7 +110,7 @@ class DemoProviderTests(unittest.TestCase):
         ns["_openrouter_generate_user_prompt"] = lambda model, contents, max_tokens: ns["_openrouter_complete"](model, [{"role": "user", "content": contents}], max_tokens)
         with patch.object(ai_provider, "complete", side_effect=httpx.ReadTimeout("provider timeout")) as complete:
             response = ns["_openrouter_generate_with_fallback"]("paid", "hello", 100)
-            self.assertEqual(response.text, ai_provider.DEMO_ERROR)
+            self.assertEqual(response.text, ai_provider.TIMEOUT_ERROR)
             complete.assert_called_once()
 
     def test_video_generation_and_model_escalation_are_blocked(self):
@@ -185,7 +185,7 @@ class DemoProviderTests(unittest.TestCase):
             calls.append(req)
             return httpx.Response(429, json={"error": "quota"})
         with patch.object(ai_provider.httpx, "AsyncClient", side_effect=lambda **kw: real(transport=httpx.MockTransport(fail), **kw)):
-            self.assertEqual(asyncio.run(collect(handlers())), [ai_provider.DEMO_ERROR])
+            self.assertEqual(asyncio.run(collect(handlers())), [ai_provider.RATE_ERROR])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].url.host, "api.groq.com")
 
@@ -211,9 +211,50 @@ class DemoProviderTests(unittest.TestCase):
         self.assertEqual(response.status_code, 415)
         with patch.object(ai_provider, "transcribe", side_effect=httpx.ReadTimeout("timeout")) as transcribe:
             response = asyncio.run(ns["alex_voice_stt"](request(b"x" * 100, "audio/mp4")))
-            self.assertEqual(response.status_code, 502)
-            self.assertEqual(json.loads(response.body)["error"], ai_provider.DEMO_ERROR)
+            self.assertEqual(response.status_code, 504)
+            self.assertEqual(json.loads(response.body)["error"], ai_provider.TIMEOUT_ERROR)
             transcribe.assert_called_once()
+
+    def test_voice_errors_are_not_spoken_or_saved_as_assistant_messages(self):
+        for name in ("alex_voice_api", "alex_voice_stream"):
+            for nudge in (False, True):
+                ns = handlers()
+                body = {"voice_key": "test-session", "silence_nudge": True} if nudge else {"voice_key": "test-session", "transcript": "question"}
+                async def run():
+                    result = await ns[name](request(json.dumps(body).encode()))
+                    if name == "alex_voice_stream":
+                        parts = [p async for p in result.body_iterator]
+                        return json.loads(parts[-1].split("data: ", 1)[1])
+                    self.assertEqual(result.status_code, 429)
+                    return json.loads(result.body)
+                req = httpx.Request("POST", DEMO.base_url + "/chat/completions")
+                error = httpx.HTTPStatusError("private key must not appear", request=req, response=httpx.Response(429, request=req))
+                with patch.object(ai_provider, "complete", side_effect=error), patch.object(ai_provider, "stream", side_effect=error):
+                    result = asyncio.run(run())
+                self.assertEqual(result["error_code"], "rate_limit")
+                self.assertFalse(result.get("speech_text"))
+                history = ns["_alex_voice_sessions"]["test-session"]["history"]
+                self.assertFalse(any(message["role"] == "assistant" for message in history))
+
+    def test_error_mapping_and_logs_do_not_expose_provider_secrets(self):
+        req = httpx.Request("POST", DEMO.base_url + "/chat/completions", headers={"Authorization": "Bearer NEVER_PRINT_ME"})
+        for status, code in [(401, "unavailable"), (403, "unavailable"), (400, "unavailable"), (429, "rate_limit"), (503, "unavailable")]:
+            error = httpx.HTTPStatusError("NEVER_PRINT_ME", request=req, response=httpx.Response(status, request=req))
+            with self.assertLogs("safe-provider-test", level="WARNING") as logged:
+                result = ai_provider.failure(error, "completion", DEMO, logging.getLogger("safe-provider-test"))
+            self.assertEqual(result.code, code)
+            self.assertIn(f"http_status={status}", logged.output[0])
+            self.assertNotIn("NEVER_PRINT_ME", " ".join(logged.output))
+        self.assertEqual(ai_provider.failure(httpx.ReadTimeout("secret"), "stream", DEMO, logging.getLogger("test")).code, "timeout")
+        self.assertEqual(ai_provider.failure(httpx.ConnectError("secret"), "stream", DEMO, logging.getLogger("test")).code, "timeout")
+
+    def test_empty_transcription_returns_retry_without_text(self):
+        async def run():
+            return await handlers()["alex_voice_stt"](request(b"a" * 100, "audio/mp4"))
+        with patch.object(ai_provider, "transcribe", side_effect=ai_provider.ProviderResponseError("empty_transcript")):
+            response = asyncio.run(run())
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(json.loads(response.body), {"text": "", "error": ai_provider.STT_ERROR, "error_code": "stt"})
 
     def test_paid_image_vision_and_tts_are_blocked_before_http(self):
         ns = handlers()

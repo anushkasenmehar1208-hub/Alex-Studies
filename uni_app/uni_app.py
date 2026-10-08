@@ -2038,13 +2038,16 @@ def _openrouter_complete(
     messages: list[dict[str, Any]],
     max_tokens: int = 2048,
     temperature: float | None = None,
+    *, raise_errors: bool = False,
 ) -> _LLMTextResponse:
     if AI_CONFIG.uses_groq:
         try:
             return _LLMTextResponse(ai_provider.complete(AI_CONFIG, messages, max_tokens, temperature))
-        except Exception:
-            logger.warning("Groq completion failed; no provider fallback used")
-            return _LLMTextResponse(ai_provider.DEMO_ERROR if AI_CONFIG.api_key else "Demo AI is not configured. Ask the organizer to set GROQ_API_KEY on the server.")
+        except Exception as exc:
+            error = ai_provider.failure(exc, "completion", AI_CONFIG, logger)
+            if raise_errors:
+                raise error from None
+            return _LLMTextResponse(str(error))
     if not OPENROUTER_API_KEY:
         return _LLMTextResponse("API not ready")
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -3077,14 +3080,16 @@ async def _openrouter_router_classify_structured(
         return dict(alex_routing.DEFAULT_ROUTE)
 
 
-async def _openrouter_stream_async(model: str, messages: list[dict], max_tokens: int = 2048):
+async def _openrouter_stream_async(model: str, messages: list[dict], max_tokens: int = 2048, *, raise_errors: bool = False):
     if AI_CONFIG.uses_groq:
         try:
             async for piece in ai_provider.stream(AI_CONFIG, messages, max_tokens):
                 yield piece
-        except Exception:
-            logger.warning("Groq stream failed; no provider fallback used")
-            yield ai_provider.DEMO_ERROR if AI_CONFIG.api_key else "Demo AI is not configured. Ask the organizer to set GROQ_API_KEY on the server."
+        except Exception as exc:
+            error = ai_provider.failure(exc, "stream", AI_CONFIG, logger)
+            if raise_errors:
+                raise error from None
+            yield str(error)
         return
     if not OPENROUTER_API_KEY:
         yield "OpenRouter API key missing — set OPENROUTER_API_KEY."
@@ -38064,7 +38069,7 @@ async def alex_voice_stt(request: Request):
         return JSONResponse({"error": "Unauthorized", "text": ""}, status_code=401)
     if not (AI_CONFIG.api_key if AI_CONFIG.uses_groq else OPENAI_API_KEY):
         return JSONResponse(
-            {"error": "GROQ_API_KEY missing (required for demo transcription)" if AI_CONFIG.uses_groq else "OPENAI_API_KEY missing (required for voice transcription)", "text": ""},
+            {"error": ai_provider.DEMO_ERROR if AI_CONFIG.uses_groq else "OPENAI_API_KEY missing (required for voice transcription)", "text": ""},
             status_code=503,
         )
 
@@ -38082,9 +38087,9 @@ async def alex_voice_stt(request: Request):
         try:
             text = await ai_provider.transcribe(AI_CONFIG, audio_bytes, content_type)
             return JSONResponse({"text": text})
-        except Exception:
-            logger.warning("Groq transcription failed; no provider fallback used")
-            return JSONResponse({"text": "", "error": ai_provider.DEMO_ERROR}, status_code=502)
+        except Exception as exc:
+            error = ai_provider.failure(exc, "stt", AI_CONFIG, logger)
+            return JSONResponse({"text": "", "error": str(error), "error_code": error.code}, status_code=error.status)
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
@@ -38408,7 +38413,7 @@ async def alex_voice_api(request: Request):
 
     if not _openrouter_llm_ready():
         return JSONResponse(
-            {"error": "AI provider key missing. Configure GROQ_API_KEY for demo mode.", "text": "", "display_html": "", "audio_b64": ""},
+            {"error": ai_provider.DEMO_ERROR, "error_code": "unavailable", "text": "", "display_html": "", "audio_b64": ""},
             status_code=503,
         )
 
@@ -38445,17 +38450,20 @@ async def alex_voice_api(request: Request):
                 OPENROUTER_VOICE_MODEL,
                 messages,
                 max_tokens,
+                raise_errors=AI_CONFIG.uses_groq,
             )
             answer_raw = (res.text or "").strip() or (
                 "I'm right here whenever you want to jump in — what's on your mind?"
             )
+        except ai_provider.VoiceProviderError as exc:
+            return JSONResponse({"error": str(exc), "error_code": exc.code}, status_code=exc.status)
         except Exception as exc:
-            logger.error("AlexVoice LLM error: %s", exc)
+            logger.error("AlexVoice LLM error: %s", type(exc).__name__)
             answer_raw = "I'm right here whenever you want to jump in — what's on your mind?"
     else:
         buf = ""
         try:
-            async for piece in _openrouter_stream_async(OPENROUTER_VOICE_MODEL, messages, max_tokens):
+            async for piece in _openrouter_stream_async(OPENROUTER_VOICE_MODEL, messages, max_tokens, raise_errors=AI_CONFIG.uses_groq):
                 if piece in (RATE_LIMIT_UI_MESSAGE, GENERIC_ERROR_UI_MESSAGE, "API not ready") or _is_rate_limit_text(
                     piece
                 ):
@@ -38467,8 +38475,10 @@ async def alex_voice_api(request: Request):
                     break
                 buf += piece
             answer_raw = (_strip_think_tags(buf) or "").strip() or "Sorry, could you say that again?"
+        except ai_provider.VoiceProviderError as exc:
+            return JSONResponse({"error": str(exc), "error_code": exc.code}, status_code=exc.status)
         except Exception as exc:
-            logger.error("AlexVoice LLM stream error: %s", exc)
+            logger.error("AlexVoice LLM stream error: %s", type(exc).__name__)
             answer_raw = "Sorry, I had trouble thinking. Could you repeat that?"
 
     answer_spoken = _polish_llm_text_for_voice_speech(answer_raw)
@@ -38533,7 +38543,7 @@ async def alex_voice_stream(request: Request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
 
     if not _openrouter_llm_ready():
-        return JSONResponse({"error": "AI provider key missing. Configure GROQ_API_KEY for demo mode."}, status_code=503)
+        return JSONResponse({"error": ai_provider.DEMO_ERROR, "error_code": "unavailable"}, status_code=503)
 
     if not silence_nudge:
         _apply_voice_language_directive_to_ctx(ctx, transcript)
@@ -38571,12 +38581,16 @@ async def alex_voice_stream(request: Request):
                         OPENROUTER_VOICE_MODEL,
                         messages,
                         max_tokens,
+                        raise_errors=AI_CONFIG.uses_groq,
                     )
                     answer_raw = (res.text or "").strip() or (
                         "I'm right here whenever you want to jump in — what's on your mind?"
                     )
+                except ai_provider.VoiceProviderError as exc:
+                    yield sse({"type": "error", "message": str(exc), "error_code": exc.code})
+                    return
                 except Exception as exc:
-                    logger.error("AlexVoice LLM error (sse nudge): %s", exc)
+                    logger.error("AlexVoice LLM error (sse nudge): %s", type(exc).__name__)
                     answer_raw = "I'm right here whenever you want to jump in — what's on your mind?"
 
                 answer_spoken = _polish_llm_text_for_voice_speech(answer_raw)
@@ -38611,7 +38625,7 @@ async def alex_voice_stream(request: Request):
             first_audio_yielded = False
 
             try:
-                async for piece in _openrouter_stream_async(OPENROUTER_VOICE_MODEL, messages, max_tokens):
+                async for piece in _openrouter_stream_async(OPENROUTER_VOICE_MODEL, messages, max_tokens, raise_errors=AI_CONFIG.uses_groq):
                     if piece in (RATE_LIMIT_UI_MESSAGE, GENERIC_ERROR_UI_MESSAGE, "API not ready") or _is_rate_limit_text(
                         piece
                     ):
@@ -38644,8 +38658,13 @@ async def alex_voice_stream(request: Request):
                             first_audio_yielded = True
 
                 answer_raw = (_strip_think_tags(buf) or "").strip() or "Sorry, could you say that again?"
+            except ai_provider.VoiceProviderError as exc:
+                if first_tts_task and not first_tts_task.done():
+                    first_tts_task.cancel()
+                yield sse({"type": "error", "message": str(exc), "error_code": exc.code})
+                return
             except Exception as exc:
-                logger.error("AlexVoice LLM stream error (sse): %s", exc)
+                logger.error("AlexVoice LLM stream error (sse): %s", type(exc).__name__)
                 if first_tts_task and not first_tts_task.done():
                     first_tts_task.cancel()
                 first_tts_task = None
@@ -38731,7 +38750,7 @@ async def alex_voice_stream(request: Request):
                 }
             )
         except Exception as exc:
-            logger.exception("AlexVoice stream SSE: %s", exc)
+            logger.error("AlexVoice stream SSE error=%s", type(exc).__name__)
             yield sse({"type": "error", "message": "Voice reply failed. Please try again."})
 
     return StreamingResponse(
@@ -39464,6 +39483,8 @@ def alex_voice_overlay_panel() -> rx.Component:
                 background:rgba(255,255,255,0.10); border-radius:4px;
             }
             .alex-chat-bubble {
+                flex-shrink:0;
+                white-space:pre-wrap;
                 max-width:88%; padding:11px 15px;
                 border-radius:16px; font-size:0.88rem; line-height:1.55;
                 word-break:break-word;

@@ -7,7 +7,54 @@ from urllib.parse import urlparse
 import httpx
 
 
-DEMO_ERROR = "Demo AI is unavailable right now. Please wait a moment and try again. No paid fallback was used."
+DEMO_ERROR = "Alex is temporarily unavailable. Please try again."
+RATE_ERROR = "Alex is getting a lot of requests right now. Try again in a moment."
+TIMEOUT_ERROR = "Alex took too long to respond. Please try again."
+STT_ERROR = "I couldn’t clearly hear that. Please try again."
+
+
+class ProviderResponseError(RuntimeError):
+    def __init__(self, kind, finish_reason=None):
+        self.kind = kind
+        self.finish_reason = finish_reason if finish_reason in ("length", "stop", "content_filter") else None
+        super().__init__(kind)
+
+
+class VoiceProviderError(RuntimeError):
+    def __init__(self, message, code, status):
+        self.code, self.status = code, status
+        super().__init__(message)
+
+
+def failure(exc, endpoint, config, logger):
+    """Log metadata only: never exception text, bodies, headers, keys or transcripts."""
+    upstream_status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    if upstream_status == 429:
+        code, message, status = "rate_limit", RATE_ERROR, 429
+    elif upstream_status in (408, 504) or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        code, message, status = "timeout", TIMEOUT_ERROR, 504
+    elif endpoint == "stt" and (upstream_status in (400, 413, 415, 422)
+                               or isinstance(exc, ProviderResponseError) and exc.kind == "empty_transcript"):
+        code, message, status = "stt", STT_ERROR, 422
+    else:
+        code, message, status = "unavailable", DEMO_ERROR, 503
+    summary = (exc.kind if isinstance(exc, ProviderResponseError) else
+               "http_error" if upstream_status else
+               "timeout" if isinstance(exc, httpx.TimeoutException) else
+               "network_error" if isinstance(exc, httpx.NetworkError) else "backend_error")
+    if upstream_status:
+        try:
+            provider_code = exc.response.json().get("error", {}).get("code")
+            if provider_code in {"invalid_api_key", "model_not_found", "model_decommissioned",
+                                 "rate_limit_exceeded", "invalid_request_error", "context_length_exceeded"}:
+                summary = "http_error:" + provider_code
+        except (ValueError, AttributeError, httpx.ResponseNotRead):
+            pass
+    logger.warning("AI failure endpoint=%s provider=groq model=%s http_status=%s summary=%s finish_reason=%s paid_fallback=false",
+                   endpoint, config.stt_model if endpoint == "stt" else config.text_model,
+                   upstream_status or (200 if isinstance(exc, ProviderResponseError) else "none"),
+                   summary, getattr(exc, "finish_reason", None))
+    return VoiceProviderError(message, code, status)
 
 
 @dataclass(frozen=True)
@@ -67,9 +114,10 @@ def complete(config, messages, max_tokens=2048, temperature=None):
         response = client.post(config.base_url + "/chat/completions", headers=config.headers(),
                                json=text_payload(config, messages, max_tokens, temperature))
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"].get("content") or ""
+        choice = response.json()["choices"][0]
+        content = choice["message"].get("content") or ""
         if not content.strip():
-            raise RuntimeError("Provider returned an empty reply")
+            raise ProviderResponseError("empty_reply", choice.get("finish_reason"))
         return content
 
 
@@ -90,7 +138,7 @@ async def stream(config, messages, max_tokens=2048):
                     break
                 chunk = json.loads(data)
                 if chunk.get("error"):
-                    raise RuntimeError("Provider stream failed")
+                    raise ProviderResponseError("stream_error")
                 choices = chunk.get("choices") or []
                 if choices:
                     content = choices[0].get("delta", {}).get("content")
@@ -98,7 +146,7 @@ async def stream(config, messages, max_tokens=2048):
                         received_content = True
                         yield content
             if not completed or not received_content:
-                raise RuntimeError("Provider stream was empty or interrupted")
+                raise ProviderResponseError("empty_stream" if completed else "interrupted_stream")
 
 
 def audio_upload(content_type):
@@ -120,4 +168,7 @@ async def transcribe(config, audio, content_type):
                                      files={"file": (filename, audio, mime)},
                                      data={"model": config.stt_model, "response_format": "json"})
         response.raise_for_status()
-        return (response.json().get("text") or "").strip()
+        text = (response.json().get("text") or "").strip()
+        if not text:
+            raise ProviderResponseError("empty_transcript")
+        return text

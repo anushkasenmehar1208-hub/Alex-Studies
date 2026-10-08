@@ -5,10 +5,21 @@
  * TTS: Browser speech in demo mode; Fish/OpenAI WAV playback otherwise.
  */
 (function () {
+  // Reflex can reload this script when the voice panel is reopened.
+  if (window.__alexVoiceCleanup) window.__alexVoiceCleanup();
   var sessionId = Math.random().toString(36).slice(2); // fallback only
+  var sessionVoiceKey = '';
   var voiceStartedAt = 0;
   var limitTimer = null;
   var active = false;
+  var starting = false;
+  var callGeneration = 0;
+  var callAbort = null;
+  var callButton = null;
+  var listenTimer = null;
+  var audioResumeTimer = null;
+  var voiceBindings = [];
+  var panelObserver = null;
   var processing = false;
   var mediaRecorder = null;
   var micStream = null;
@@ -71,11 +82,37 @@
   /** Wait before reopening the mic after Alex finishes speaking — reduces speaker→mic echo re-triggering STT. */
   var POST_SPEECH_MIC_DELAY_MS = 250;
 
-  function scheduleListenAfterSpeech() {
+  function clearListenTimer() {
+    if (listenTimer) clearTimeout(listenTimer);
+    listenTimer = null;
+  }
+
+  function isCurrentCall(generation) {
+    return active && generation === callGeneration;
+  }
+
+  function setMicTracksEnabled(enabled) {
+    if (micStream) micStream.getAudioTracks().forEach(function (track) { track.enabled = enabled; });
+  }
+
+  function pauseMicrophone() {
+    clearListenTimer();
+    abortCurrentListenSegment();
+    setMicTracksEnabled(false);
+  }
+
+  function scheduleListenAfterSpeech(delay) {
+    clearListenTimer();
     if (!active) return;
-    setTimeout(function () {
-      if (active) startListening();
-    }, POST_SPEECH_MIC_DELAY_MS);
+    if (micMuted()) {
+      if (!processing) setStatus('Muted');
+      return;
+    }
+    var generation = callGeneration;
+    listenTimer = setTimeout(function () {
+      listenTimer = null;
+      if (isCurrentCall(generation)) startListening();
+    }, typeof delay === 'number' ? delay : POST_SPEECH_MIC_DELAY_MS);
   }
 
   /**
@@ -85,20 +122,23 @@
   var alexAudioChain = Promise.resolve();
   /** Active stream clip — stopped when clearing playback. */
   var alexStreamActiveAudio = null;
+  var alexStreamObjectUrl = null;
+  var playbackGeneration = 0;
   /** Segments enqueued but not yet finished playing. */
   var alexPendingSegments = 0;
   /** True once the SSE 'done' event has been received for the current stream. */
   var alexSseDone = false;
 
   function stopAlexPlaybackEngine() {
+    playbackGeneration++;
     if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
     browserSpeechTimer = null;
     if (browserUtterance) {
       browserUtterance.onend = null;
       browserUtterance.onerror = null;
       browserUtterance = null;
-      try { window.speechSynthesis.cancel(); } catch (eCancel) {}
     }
+    try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (eCancel) {}
     try {
       if (alexStreamActiveAudio) {
         alexStreamActiveAudio.onended = null;
@@ -107,6 +147,10 @@
         alexStreamActiveAudio = null;
       }
     } catch (eSt) {}
+    if (alexStreamObjectUrl) {
+      try { URL.revokeObjectURL(alexStreamObjectUrl); } catch (eUrl) {}
+      alexStreamObjectUrl = null;
+    }
     alexAudioChain = Promise.resolve();
     alexPendingSegments = 0;
     alexSseDone = false;
@@ -121,7 +165,11 @@
     var raw = (b64 || '').trim();
     if (!raw) return alexAudioChain;
     alexPendingSegments++;
+    var generation = playbackGeneration;
     alexAudioChain = alexAudioChain.then(function () {
+      if (!active || generation !== playbackGeneration) return;
+      pauseMicrophone();
+      processing = true;
       setOrbState('ai-speaking');
       setStatus('Alex is speaking...');
       return new Promise(function (resolve) {
@@ -133,11 +181,13 @@
         }
         var a = new Audio(url);
         alexStreamActiveAudio = a;
+        alexStreamObjectUrl = url;
         a.onended = function () {
           try {
             URL.revokeObjectURL(url);
           } catch (eR) {}
           if (alexStreamActiveAudio === a) alexStreamActiveAudio = null;
+          if (alexStreamObjectUrl === url) alexStreamObjectUrl = null;
           alexPendingSegments--;
           if (alexPendingSegments === 0 && !alexSseDone) {
             setOrbState('thinking');
@@ -149,6 +199,7 @@
             URL.revokeObjectURL(url);
           } catch (eR2) {}
           if (alexStreamActiveAudio === a) alexStreamActiveAudio = null;
+          if (alexStreamObjectUrl === url) alexStreamObjectUrl = null;
           alexPendingSegments--;
           resolve();
         };
@@ -163,6 +214,7 @@
               URL.revokeObjectURL(url);
             } catch (eRv) {}
             if (alexStreamActiveAudio === a) alexStreamActiveAudio = null;
+            if (alexStreamObjectUrl === url) alexStreamObjectUrl = null;
             alexPendingSegments--;
             resolve();
           });
@@ -174,10 +226,15 @@
 
   // Browser speech is selected explicitly by the server; never call paid TTS from here.
   function speakBrowserReply(data, onDone) {
+    if (!active) return;
+    var generation = callGeneration;
+    pauseMicrophone();
+    processing = true;
     var finished = false;
     function finish(error) {
       if (finished) return;
       finished = true;
+      if (!isCurrentCall(generation)) return;
       if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
       browserSpeechTimer = null;
       if (browserUtterance) {
@@ -186,6 +243,7 @@
       }
       browserUtterance = null;
       if (error) {
+        try { window.speechSynthesis.cancel(); } catch (eCancel) {}
         setStatus('Reply on screen only');
         appendVoiceServerNotice('Browser speech is unavailable. Read the reply above or continue by typing.');
       }
@@ -214,7 +272,6 @@
       // Recover from browsers that never fire an end/error event.
       browserSpeechTimer = setTimeout(function () {
         finish(true);
-        try { window.speechSynthesis.cancel(); } catch (eCancel) {}
       }, 60000);
       window.speechSynthesis.speak(utterance);
     } catch (eSpeech) {
@@ -226,6 +283,9 @@
    * SSE: first audio may arrive while the model is still generating; tail + done follow.
    */
   async function consumeAlexVoiceStream(response, uLine) {
+    var generation = callGeneration;
+    pauseMicrophone();
+    processing = true;
     stopAlexPlaybackEngine();
     var carry = '';
     var decoder = new TextDecoder();
@@ -233,18 +293,20 @@
     var streamUiDone = false;
 
     function streamPlaybackFinished() {
+      if (!isCurrentCall(generation)) return;
       processing = false;
       setOrbState('idle');
       if (active) scheduleListenAfterSpeech();
     }
 
     function dispatch(obj) {
+      if (!isCurrentCall(generation)) return;
       if (!obj || !obj.type) return;
       if (obj.type === 'audio') {
         var ab = (obj.audio_b64 || '').trim();
         if (!ab) return;
         heardAudio = true;
-        processing = false;
+        processing = true;
         setOrbState('ai-speaking');
         setStatus('Alex is speaking...');
         if (!streamUiDone) setTranscript('');
@@ -285,7 +347,7 @@
       }
       if (obj.type === 'error') {
         streamUiDone = true;
-        appendVoiceServerNotice(obj.message || 'Voice reply failed.');
+        appendVoiceServerNotice(voiceErrorMessage(0, obj.error_code, false));
         try {
           window.__voiceLastUserLine = '';
         } catch (eZ2) {}
@@ -298,6 +360,7 @@
       var reader = response.body.getReader();
       while (true) {
         var rd = await reader.read();
+        if (!isCurrentCall(generation)) { await reader.cancel(); return; }
         if (rd.done) break;
         carry += decoder.decode(rd.value, { stream: true });
         var parts = carry.split('\n\n');
@@ -318,7 +381,8 @@
       }
       if (!streamUiDone) throw new Error('Voice stream ended before the reply completed');
     } catch (eRead) {
-      appendVoiceServerNotice('Voice connection was interrupted. Please try again.');
+      if (!isCurrentCall(generation)) return;
+      appendVoiceServerNotice(voiceErrorMessage(0, 'network', false));
       console.error('[AlexVoice] stream read error:', eRead);
       stopAlexPlaybackEngine();
       processing = false;
@@ -345,9 +409,10 @@
   var VAD_SPEECH_END_RMS = 10;
   // Require this many ms of continuous “loud” before we treat it as real speech
   var VAD_SPEECH_SUSTAIN_MS = 140;
-  // Still run STT if blob is at least this big, even when VAD never armed (fixes “ok” / whispers)
+  // Reject tiny clips after real speech has armed VAD.
   var MIN_BLOB_FOR_STT = 80;
-  var SILENCE_DURATION = 700;    // ms of silence before auto-stop (ChatGPT/Gemini-like snappiness)
+  var END_OF_SPEECH_SILENCE_MS = 425;
+  var VAD_POLL_MS = 25;
   var MAX_RECORD_MS = 15000;     // absolute max recording time
   /** If user never starts speaking, Alex checks in after this many ms (keep high to avoid nagging / repeat). */
   var NO_SPEECH_NUDGE_MS = 12000;
@@ -364,7 +429,7 @@
   }
 
   function voiceKey() {
-    return window.ALEX_VOICE_KEY || sessionId;
+    return sessionVoiceKey || window.ALEX_VOICE_KEY || sessionId;
   }
 
   function authToken() {
@@ -461,22 +526,26 @@
     } catch (e0) {}
     syncMicToggleButton();
     if (muted && active) {
-      abortCurrentListenSegment();
-      stopVAD();
-      clearNoSpeechNudgeTimer();
-      silenceNudgePending = false;
-      setOrbState('idle');
-      setStatus('Mic muted — type below; tap Unmute mic to speak again');
+      pauseMicrophone();
+      if (!processing) {
+        setOrbState('idle');
+        setStatus('Muted');
+      }
     } else if (!muted && active && !processing) {
       startListening();
     }
+  }
+
+  function bindVoiceHandler(element, type, handler) {
+    element.addEventListener(type, handler);
+    voiceBindings.push({ element: element, type: type, handler: handler });
   }
 
   function attachMicToggle() {
     var b = document.getElementById('alex-mic-toggle');
     if (b && !b._alexMicBound) {
       b._alexMicBound = true;
-      b.addEventListener('click', function () {
+      bindVoiceHandler(b, 'click', function () {
         if (b.disabled) return;
         tryPrimeAudioOnUserGesture();
         setMicMuted(!micMuted());
@@ -485,23 +554,24 @@
   }
 
   function installPageHideEndVoiceOnce() {
-    if (window.__alex_voice_pagehide_installed) return;
-    window.__alex_voice_pagehide_installed = true;
     // Only end on actual navigation/close — NOT on tab-switch (visibilitychange).
-    window.addEventListener('pagehide', function () {
-      try {
-        if (window.__alex_voice_session_active && window.stopAlexVoiceSession) {
-          window.stopAlexVoiceSession();
-        }
-      } catch (ePh) {}
-    });
+    window.addEventListener('pagehide', endVoiceOnNavigation);
+    window.addEventListener('beforeunload', endVoiceOnNavigation);
     // Tab switch policy:
     //   - Tab hidden  → pause Alex's voice playback so the user doesn't hear
     //     the AI talking in the background while they're working in another
     //     tab. We pause (don't dispose) so the clip can resume seamlessly.
     //   - Tab visible → resume any paused playback and resume a suspended
     //     AudioContext so MediaRecorder/STT keeps working.
-    document.addEventListener('visibilitychange', function () {
+    document.addEventListener('visibilitychange', handleVoiceVisibility);
+  }
+
+  function endVoiceOnNavigation() {
+    if (active || starting) stopAlex(false, true);
+  }
+
+  function handleVoiceVisibility() {
+      if (!active) return;
       if (document.hidden) {
         try {
           if (currentAudio && !currentAudio.paused) {
@@ -538,12 +608,13 @@
         }
       } catch (eRb) {}
       try {
-        if (alexStreamActiveAudio || (currentAudio && !currentAudio.paused)) {
+        if (browserUtterance || alexStreamActiveAudio || (currentAudio && !currentAudio.paused)) {
           setOrbState('ai-speaking');
           setStatus('Alex is speaking...');
+        } else if (!processing) {
+          setStatus(micMuted() ? 'Muted' : 'Listening…');
         }
       } catch (eRs) {}
-    });
   }
   installPageHideEndVoiceOnce();
 
@@ -570,7 +641,7 @@
     var btn = document.getElementById('alex-btn');
     if (btn && !btn._alexBound) {
       btn._alexBound = true;
-      btn.addEventListener('click', function () { toggleAlexVoice(); });
+      bindVoiceHandler(btn, 'click', function () { window.toggleAlexVoice(); });
       console.log('[AlexVoice] button bound');
     }
   }
@@ -591,10 +662,16 @@
     var snd = document.getElementById('alex-type-send');
     if (inp && !inp._alexBound) {
       inp._alexBound = true;
-      inp.addEventListener('focus', function () {
-        if (active) abortCurrentListenSegment();
+      bindVoiceHandler(inp, 'focus', function () {
+        if (active) {
+          pauseMicrophone();
+          if (!processing && !micMuted()) setStatus('Type your message…');
+        }
       });
-      inp.addEventListener('keydown', function (ev) {
+      bindVoiceHandler(inp, 'blur', function () {
+        if (active && !processing) scheduleListenAfterSpeech();
+      });
+      bindVoiceHandler(inp, 'keydown', function (ev) {
         if (ev.key === 'Enter' && !ev.shiftKey) {
           ev.preventDefault();
           sendTypedAlexMessage();
@@ -603,7 +680,7 @@
     }
     if (snd && !snd._alexBound) {
       snd._alexBound = true;
-      snd.addEventListener('click', function () { sendTypedAlexMessage(); });
+      bindVoiceHandler(snd, 'click', function () { sendTypedAlexMessage(); });
     }
   }
 
@@ -621,8 +698,17 @@
     var i = document.getElementById('alex-type-input');
     if ((b && b._alexBound && i && i._alexBound) || _bindAttempts > 100) {
       clearInterval(_bindPoll);
+      _bindPoll = null;
     }
   }, 300);
+
+  // React can remove the panel without a full page navigation.
+  if (window.MutationObserver) {
+    panelObserver = new window.MutationObserver(function () {
+      if ((active || starting) && callButton && !callButton.isConnected) stopAlex(false, true);
+    });
+    panelObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
 
   // ── UI helpers ──────────────────────────────────────────────
   function setStatus(msg) {
@@ -712,22 +798,31 @@
     el.appendChild(wrap);
   }
 
+  var MAX_VOICE_MESSAGES = 40;
+
+  function voiceErrorMessage(status, code, isStt) {
+    if (status === 429 || code === 'rate_limit') return 'Alex is getting a lot of requests right now. Try again in a moment.';
+    if (status === 408 || status === 504 || code === 'timeout' || code === 'network') return 'Alex took too long to respond. Please try again.';
+    if (isStt || code === 'stt') return 'I couldn’t clearly hear that. Please try again.';
+    return 'Alex is temporarily unavailable. Please try again.';
+  }
+
   function appendChatBubble(role, html, plain) {
-    // Desktop right-side panel (hidden on mobile via CSS)
-    var panel = document.getElementById('alex-chat-panel');
-    // Mobile transparent chat panel (visible on mobile only via CSS)
-    var mobilePanel = document.getElementById('alex-mobile-chat-panel');
-    var targetPanel = (mobilePanel && window.innerWidth <= 900) ? mobilePanel : panel;
-    if (!targetPanel) return;
-    var bubble = document.createElement('div');
-    bubble.className = 'alex-chat-bubble alex-chat-' + role;
-    if (role === 'alex' && html) {
-      bubble.innerHTML = html;
-    } else {
-      bubble.textContent = plain || '';
-    }
-    targetPanel.appendChild(bubble);
-    targetPanel.scrollTop = targetPanel.scrollHeight;
+    plain = typeof plain === 'string' ? plain.trim() : '';
+    if (!plain && !(role === 'alex' && html)) return;
+    // Mirror both responsive panels so resizing never loses half the conversation.
+    ['alex-chat-panel', 'alex-mobile-chat-panel'].forEach(function (id) {
+      var panel = document.getElementById(id);
+      if (!panel) return;
+      var bubble = document.createElement('div');
+      bubble.className = 'alex-chat-bubble alex-chat-' + role;
+      bubble.setAttribute('aria-label', role === 'user' ? 'You' : 'Alex');
+      if (role === 'alex' && html) bubble.innerHTML = html;
+      else bubble.textContent = plain;
+      panel.appendChild(bubble);
+      while (panel.children.length > MAX_VOICE_MESSAGES) panel.removeChild(panel.firstElementChild);
+      panel.scrollTop = panel.scrollHeight;
+    });
   }
 
   function renderVoiceTranscriptBlock(userLinePlain, alexData) {
@@ -778,7 +873,7 @@
 
   // ── Toggle ──────────────────────────────────────────────────
   window.toggleAlexVoice = async function () {
-    if (active) { stopAlex(); return; }
+    if (active || starting) { stopAlex(); return; }
     tryPrimeAudioOnUserGesture();
 
     // Check access before requesting mic
@@ -806,27 +901,60 @@
       return;
     }
 
+    starting = true;
+    var generation = ++callGeneration;
+    callAbort = new AbortController();
+    callButton = document.getElementById('alex-btn');
+    sessionVoiceKey = window.ALEX_VOICE_KEY || sessionId;
+    window.__alex_voice_session_active = true;
+    window.__alex_mic_muted = false;
+    syncMicToggleButton();
+    setStatus('Starting microphone…');
+    if (callButton) { callButton.textContent = 'END CALL'; callButton.disabled = false; }
+
     try {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!navigator.mediaDevices || !window.MediaRecorder) throw new Error('Microphone recording is unavailable in this browser.');
+      // Invoke these before the first await, while Start Call's user gesture is available.
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      var resumed = audioContext.resume().catch(function () {});
+      try { if (window.speechSynthesis) window.speechSynthesis.resume(); } catch (eResume) {}
+      var stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      // getUserMedia cannot be aborted: release a permission result that arrived after End Call.
+      if (!starting || generation !== callGeneration) {
+        stream.getTracks().forEach(function (track) { track.stop(); });
+        return;
+      }
+      micStream = stream;
+      await Promise.race([resumed, new Promise(function (resolve) {
+        audioResumeTimer = setTimeout(resolve, 1500);
+      })]);
+      if (!starting || generation !== callGeneration) return;
+      if (audioResumeTimer) clearTimeout(audioResumeTimer);
+      audioResumeTimer = null;
+      if (audioContext.state === 'suspended') throw new Error('Tap Start Call to enable microphone audio in this browser.');
+      var source = audioContext.createMediaStreamSource(micStream);
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
     } catch (e) {
-      alert('Microphone access is required for voice chat.');
+      if (!starting || generation !== callGeneration) return;
+      stopAlex(true, true);
       var bMic = document.getElementById('alex-btn');
-      if (bMic) { bMic.textContent = 'Try again'; bMic.disabled = false; bMic.classList.remove('live'); }
-      setStatus('Microphone blocked');
+      if (bMic) { bMic.textContent = 'Start Call'; bMic.disabled = false; }
+      setStatus(e.name === 'NotAllowedError' ? 'Microphone permission required' : 'Tap Start Call to try again');
+      appendVoiceServerNotice(e.name === 'NotAllowedError'
+        ? 'Allow microphone access for this site in Safari, then tap Start Call.'
+        : (e.message || 'Could not start the microphone. Tap Start Call to try again.'));
       return;
     }
 
-    // Setup audio analysis for VAD
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    var source = audioContext.createMediaStreamSource(micStream);
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 512;
-    source.connect(analyser);
-
+    starting = false;
     active = true;
     try {
       window.__alex_voice_session_active = true;
-      window.__alex_mic_muted = true;
+      window.__alex_mic_muted = false;
     } catch (eSess) {}
     // GA funnel event: voice session truly started after microphone access succeeds; no transcript is sent.
     try {
@@ -858,50 +986,54 @@
       }, remainingSec * 1000);
     }
 
+    startListening();
     if (!introPlayed) {
       introPlayed = true;
       playIntro();
-    } else {
-      startListening();
     }
   };
 
   // ── Auto-introduction ────────────────────────────────────────
   async function playIntro() {
-    setOrbState('thinking');
-    setStatus('Alex is waking up...');
-    setTranscript('');
+    var generation = callGeneration;
+    var introRecorder = mediaRecorder;
     try {
       var resp = await fetch(
         apiBase() + '/api/alex-voice-intro?voice_key=' + encodeURIComponent(voiceKey()),
-        { headers: authHeadersForGet() }
+        { headers: authHeadersForGet(), signal: callAbort.signal }
       );
+      if (!isCurrentCall(generation)) return;
       if (!resp.ok) {
         if (handleVoiceHttpError(resp.status)) return;
         setStatus('Could not load intro');
         setTranscript('Tap END CALL and try again, or reload the page.');
-        if (active) startListening();
         return;
       }
       var data = await resp.json();
+      // Never interrupt a question the student already started while the greeting loaded.
+      if (!isCurrentCall(generation) || processing || speechDetected || mediaRecorder !== introRecorder) return;
       playAlexVoiceResponse(data);
     } catch (e) {
+      if (!isCurrentCall(generation)) return;
       console.error('[AlexVoice] intro error:', e);
-      if (active) startListening();
     }
   }
 
   // ── Listening with silence detection ────────────────────────
   function startListening() {
-    if (!active || !micStream) return;
+    if (!active || !micStream || processing) return;
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') return;
+    clearListenTimer();
     if (micMuted()) {
-      processing = false;
+      setMicTracksEnabled(false);
       setOrbState('idle');
-      setStatus('Mic muted — type below; tap Unmute mic to speak again');
+      setStatus('Muted');
       return;
     }
-    processing = false;
-    audioChunks = [];
+    setMicTracksEnabled(true);
+    var generation = callGeneration;
+    var chunks = [];
+    audioChunks = chunks;
     speechDetected = false;
     silenceStart = 0;
     vadSmoothedRms = 0;
@@ -909,7 +1041,7 @@
     silenceNudgePending = false;
     clearNoSpeechNudgeTimer();
     setOrbState('idle');
-    setStatus('Listening to you, bro...');
+    setStatus('Listening…');
     setTranscript('');
 
     // Choose supported mime
@@ -923,41 +1055,52 @@
     } catch (e) {
       console.error('[AlexVoice] MediaRecorder error (will retry):', e);
       setStatus('Mic recovering...');
+      setMicTracksEnabled(false);
       // AudioContext may still be resuming after tab was backgrounded — retry.
-      setTimeout(function () { if (active) startListening(); }, 800);
+      scheduleListenAfterSpeech(800);
       return;
     }
 
-    mediaRecorder.ondataavailable = function (e) {
-      if (e.data && e.data.size > 0) audioChunks.push(e.data);
+    var recorder = mediaRecorder;
+    recorder.ondataavailable = function (e) {
+      if (isCurrentCall(generation) && mediaRecorder === recorder && e.data && e.data.size > 0) chunks.push(e.data);
     };
 
-    mediaRecorder.onstop = function () {
+    recorder.onstop = function () {
+      if (!isCurrentCall(generation) || mediaRecorder !== recorder || micMuted()) return;
       stopVAD();
-      if (!active) return;
+      mediaRecorder = null;
+      audioChunks = [];
       if (silenceNudgePending) {
         silenceNudgePending = false;
         fetchSilenceNudgeAndPlay();
         return;
       }
-      if (audioChunks.length === 0) { startListening(); return; }
-
-      var blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-      console.log('[AlexVoice] recorded', blob.size, 'B, vadSpeech=' + speechDetected);
-      if (blob.size < MIN_BLOB_FOR_STT) { startListening(); return; }
-
-      if (!speechDetected) {
-        console.log('[AlexVoice] VAD did not flag speech — running STT anyway (short/quiet clips)');
+      if (!speechDetected || chunks.length === 0) {
+        processing = false;
+        startListening();
+        return;
       }
+
+      var blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      console.log('[AlexVoice] recorded', blob.size, 'B, vadSpeech=' + speechDetected);
+      if (blob.size < MIN_BLOB_FOR_STT) { processing = false; startListening(); return; }
 
       processing = true;
       setOrbState('thinking');
-      setStatus('Processing...');
+      setStatus('Thinking…');
       setTranscript('');
       transcribeAndRespond(blob);
     };
 
-    mediaRecorder.start(200);
+    try {
+      recorder.start(200);
+    } catch (eStart) {
+      pauseMicrophone();
+      setStatus('Mic recovering...');
+      scheduleListenAfterSpeech(800);
+      return;
+    }
 
     // Start VAD — monitors audio level and auto-stops on silence
     startVAD();
@@ -978,6 +1121,7 @@
     var dataArray = new Uint8Array(analyser.fftSize);
 
     vadInterval = setInterval(function () {
+      if (!active || processing || micMuted()) return;
       analyser.getByteTimeDomainData(dataArray);
 
       var sum = 0;
@@ -1000,7 +1144,7 @@
             clearTimeout(noSpeechNudgeTimer);
             noSpeechNudgeTimer = null;
             setOrbState('user-speaking');
-            setStatus('Hearing you...');
+            setStatus('Listening…');
             silenceStart = 0;
             console.log('[AlexVoice] speech started (sustained)');
           }
@@ -1009,17 +1153,17 @@
         }
       } else {
         // Hysteresis: end only when level drops below lower threshold
-        if (vadSmoothedRms >= VAD_SPEECH_END_RMS) {
+        if (rawRms >= VAD_SPEECH_END_RMS) {
           silenceStart = 0;
         } else {
           if (!silenceStart) silenceStart = now;
-          else if (now - silenceStart > SILENCE_DURATION) {
+          else if (now - silenceStart >= END_OF_SPEECH_SILENCE_MS) {
             console.log('[AlexVoice] silence detected, auto-stopping');
             finishRecording();
           }
         }
       }
-    }, 100);
+    }, VAD_POLL_MS);
   }
 
   function stopVAD() {
@@ -1047,6 +1191,13 @@
 
   function finishRecording() {
     stopVAD();
+    clearNoSpeechNudgeTimer();
+    setMicTracksEnabled(false);
+    if (speechDetected) {
+      processing = true;
+      setStatus('Thinking…');
+      setOrbState('thinking');
+    }
     if (mediaRecorder && mediaRecorder.state === 'recording') {
       mediaRecorder.stop();
     }
@@ -1057,16 +1208,25 @@
     stopVAD();
     clearNoSpeechNudgeTimer();
     silenceNudgePending = false;
-    if (mediaRecorder && mediaRecorder.state === 'recording') {
-      mediaRecorder.onstop = null;
-      mediaRecorder.stop();
+    var recorder = mediaRecorder;
+    mediaRecorder = null;
+    if (recorder) {
+      // A manual mute can cancel the brief interval between stop() and its onstop event.
+      processing = false;
+      recorder.onstop = null;
+      recorder.ondataavailable = null;
+      try { if (recorder.state !== 'inactive') recorder.stop(); } catch (eStop) {}
     }
     audioChunks = [];
   }
 
   async function fetchVoiceReplyAndPlay(transcript) {
+    if (!active) return;
+    var generation = callGeneration;
+    pauseMicrophone();
+    processing = true;
     setOrbState('thinking');
-    setStatus('Alex is thinking...');
+    setStatus('Thinking…');
     var uLine = '';
     try {
       uLine = window.__voiceLastUserLine || '';
@@ -1078,8 +1238,10 @@
       var streamResp = await fetch(apiBase() + '/api/alex-voice-stream', {
         method: 'POST',
         headers: headers,
-        body: payload
+        body: payload,
+        signal: callAbort.signal
       });
+      if (!isCurrentCall(generation)) return;
       if (streamResp.ok) {
         var ct = (streamResp.headers.get('content-type') || '').toLowerCase();
         if (ct.indexOf('text/event-stream') >= 0 && streamResp.body && streamResp.body.getReader) {
@@ -1089,15 +1251,18 @@
         var jsonResp = await fetch(apiBase() + '/api/alex-voice', {
           method: 'POST',
           headers: headers,
-          body: payload
+          body: payload,
+          signal: callAbort.signal
         });
+        if (!isCurrentCall(generation)) return;
         if (!jsonResp.ok) {
           if (handleVoiceHttpError(jsonResp.status)) return;
-          var vErr2 = 'Voice reply failed.';
+          var vErr2 = voiceErrorMessage(jsonResp.status, '', false);
           try {
             var vBody2 = await jsonResp.json();
-            if (vBody2.error) vErr2 = String(vBody2.error);
+            vErr2 = voiceErrorMessage(jsonResp.status, vBody2.error_code, false);
           } catch (eJ2) {}
+          if (!isCurrentCall(generation)) return;
           setStatus('Alex could not reply');
           try {
             window.__voiceLastUserLine = '';
@@ -1105,21 +1270,22 @@
           setTranscript(vErr2);
           setOrbState('idle');
           processing = false;
-          setTimeout(function () { if (active) startListening(); }, 2200);
+          scheduleListenAfterSpeech(2200);
           return;
         }
         var dataFb = await jsonResp.json();
-        processing = false;
+        if (!isCurrentCall(generation)) return;
         playAlexVoiceResponse(dataFb);
         return;
       }
       if (!streamResp.ok) {
         if (handleVoiceHttpError(streamResp.status)) return;
-        var vErr = 'Voice reply failed.';
+        var vErr = voiceErrorMessage(streamResp.status, '', false);
         try {
           var vBody = await streamResp.json();
-          if (vBody.error) vErr = String(vBody.error);
+          vErr = voiceErrorMessage(streamResp.status, vBody.error_code, false);
         } catch (e2) {}
+        if (!isCurrentCall(generation)) return;
         setStatus('Alex could not reply');
         try {
           window.__voiceLastUserLine = '';
@@ -1127,18 +1293,20 @@
         setTranscript(vErr);
         setOrbState('idle');
         processing = false;
-        setTimeout(function () { if (active) startListening(); }, 2200);
+        scheduleListenAfterSpeech(2200);
         return;
       }
     } catch (err) {
+      if (!isCurrentCall(generation)) return;
       console.error('[AlexVoice] API error:', err);
       try {
         window.__voiceLastUserLine = '';
       } catch (eClr2) {}
-      setStatus('Network error — retrying...');
+      setStatus(voiceErrorMessage(0, 'network', false));
+      appendVoiceServerNotice(voiceErrorMessage(0, 'network', false));
       setOrbState('idle');
       processing = false;
-      setTimeout(function () { if (active) startListening(); }, 1500);
+      scheduleListenAfterSpeech(1500);
     }
   }
 
@@ -1159,11 +1327,11 @@
 
     disposeCurrentPlayback();
 
-    abortCurrentListenSegment();
+    pauseMicrophone();
 
     processing = true;
     setOrbState('thinking');
-    setStatus('Alex is thinking...');
+    setStatus('Thinking…');
     window.__voiceLastUserLine = 'You: ' + text;
     appendChatBubble('user', null, text);
     setTranscript('');
@@ -1172,6 +1340,10 @@
   }
 
   function playAlexVoiceResponse(data) {
+    if (!active) return;
+    var generation = callGeneration;
+    pauseMicrophone();
+    processing = true;
     var uLine = window.__voiceLastUserLine || '';
     window.__voiceLastUserLine = '';
     applyAlexLanguagePrefsFromVoice(data);
@@ -1186,6 +1358,7 @@
     }
 
     function done(opts) {
+      if (!isCurrentCall(generation)) return;
       opts = opts || {};
       processing = false;
       if (!opts.keepReadingPane) setTranscript('');
@@ -1216,6 +1389,7 @@
     }
 
     function playWavSegment(b64) {
+      if (!isCurrentCall(generation)) return;
       if (!b64) {
         scheduleNextOrDone();
         return;
@@ -1245,6 +1419,7 @@
         done({ keepReadingPane: true });
       };
       currentAudio.play().catch(function (err) {
+        if (!isCurrentCall(generation)) return;
         console.warn('[AlexVoice] audio.play() failed', err);
         try {
           currentAudio.pause();
@@ -1275,9 +1450,11 @@
 
   async function fetchSilenceNudgeAndPlay() {
     if (!active) return;
+    var generation = callGeneration;
+    pauseMicrophone();
     processing = true;
     setOrbState('thinking');
-    setStatus('Alex is checking in...');
+    setStatus('Thinking…');
     setTranscript('');
     var headers = authHeadersJson();
     var payload = JSON.stringify({ silence_nudge: true, voice_key: voiceKey() });
@@ -1286,8 +1463,10 @@
       var streamResp = await fetch(apiBase() + '/api/alex-voice-stream', {
         method: 'POST',
         headers: headers,
-        body: payload
+        body: payload,
+        signal: callAbort.signal
       });
+      if (!isCurrentCall(generation)) return;
       if (streamResp.ok) {
         var ct = (streamResp.headers.get('content-type') || '').toLowerCase();
         if (ct.indexOf('text/event-stream') >= 0 && streamResp.body && streamResp.body.getReader) {
@@ -1297,8 +1476,10 @@
         var jsonResp = await fetch(apiBase() + '/api/alex-voice', {
           method: 'POST',
           headers: headers,
-          body: payload
+          body: payload,
+          signal: callAbort.signal
         });
+        if (!isCurrentCall(generation)) return;
         if (!jsonResp.ok) {
           if (handleVoiceHttpError(jsonResp.status)) return;
           processing = false;
@@ -1307,7 +1488,7 @@
           return;
         }
         var data = await jsonResp.json();
-        processing = false;
+        if (!isCurrentCall(generation)) return;
         playAlexVoiceResponse(data);
         return;
       }
@@ -1319,60 +1500,73 @@
         return;
       }
     } catch (e) {
+      if (!isCurrentCall(generation)) return;
       console.error('[AlexVoice] silence nudge error:', e);
       processing = false;
       setOrbState('idle');
-      setTimeout(function () { if (active) scheduleListenAfterSpeech(); }, 1200);
+      scheduleListenAfterSpeech(1200);
     }
   }
 
   // ── Transcribe → LLM → TTS → Play ──────────────────────────
   async function transcribeAndRespond(audioBlob) {
+    if (!active) return;
+    var generation = callGeneration;
+    pauseMicrophone();
+    processing = true;
     clearNoSpeechNudgeTimer();
     // Step 1: STT
-    setStatus('Transcribing...');
+    setStatus('Thinking…');
     var transcript = '';
     try {
       var sttResp = await fetch(apiBase() + '/api/alex-voice-stt', {
         method: 'POST',
         headers: authHeadersForStt(audioBlob.type),
-        body: audioBlob
+        body: audioBlob,
+        signal: callAbort.signal
       });
+      if (!isCurrentCall(generation)) return;
       if (!sttResp.ok) {
         if (handleVoiceHttpError(sttResp.status)) return;
-        var sttErr = 'Transcription failed. Try again.';
+        var sttErr = voiceErrorMessage(sttResp.status, '', true);
         try {
           var sttErrBody = await sttResp.json();
-          if (sttErrBody.error) sttErr = String(sttErrBody.error);
+          sttErr = voiceErrorMessage(sttResp.status, sttErrBody.error_code, true);
         } catch (e1) {}
+        if (!isCurrentCall(generation)) return;
         setOrbState('idle');
-        setStatus('Could not transcribe');
+        setStatus(sttErr);
         setTranscript(sttErr);
         processing = false;
-        setTimeout(function () { if (active) startListening(); }, 2200);
+        scheduleListenAfterSpeech(2200);
         return;
       }
       var sttData = await sttResp.json();
-      transcript = (sttData.text || '').trim();
-      console.log('[AlexVoice] transcript:', transcript);
+      if (!isCurrentCall(generation)) return;
+      transcript = !sttData.error && typeof sttData.text === 'string' ? sttData.text.trim() : '';
       if (transcript) {
         window.__voiceLastUserLine = 'You: ' + transcript;
         appendChatBubble('user', null, transcript);
+        setStatus('Thinking…');
       }
       setTranscript('');
     } catch (e) {
+      if (!isCurrentCall(generation)) return;
       console.error('[AlexVoice] STT error:', e);
       setOrbState('idle');
-      setStatus('Transcription error');
+      setStatus(voiceErrorMessage(0, 'network', true));
+      appendVoiceServerNotice(voiceErrorMessage(0, 'network', true));
       processing = false;
-      setTimeout(function () { if (active) startListening(); }, 1500);
+      scheduleListenAfterSpeech(1500);
       return;
     }
 
     if (!transcript.length) {
       setOrbState('idle');
       processing = false;
-      startListening();
+      setStatus(voiceErrorMessage(0, 'stt', true));
+      appendVoiceServerNotice(voiceErrorMessage(0, 'stt', true));
+      scheduleListenAfterSpeech(1500);
       return;
     }
 
@@ -1380,17 +1574,48 @@
   }
 
   // ── Stop ────────────────────────────────────────────────────
-  function stopAlex(skipSync) {
-    // Fire-and-forget: sync voice session back to text chat DB
+  function stopAlex(skipSync, keepOverlay) {
+    var wasRunning = active || starting;
+    var syncKey = voiceKey();
     var durationSec = voiceStartedAt ? Math.round((Date.now() - voiceStartedAt) / 1000) : 0;
+    // Invalidate callbacks FIRST, then release hardware before any network/UI work.
+    active = false;
+    starting = false;
+    processing = false;
+    callGeneration++;
+    if (callAbort) callAbort.abort();
+    callAbort = null;
+    clearListenTimer();
+    if (audioResumeTimer) clearTimeout(audioResumeTimer);
+    audioResumeTimer = null;
+    if (limitTimer) clearTimeout(limitTimer);
+    limitTimer = null;
+    if (_bindPoll) clearInterval(_bindPoll);
+    _bindPoll = null;
+    abortCurrentListenSegment();
+    if (micStream) {
+      micStream.getTracks().forEach(function (track) { try { track.stop(); } catch (eTrack) {} });
+      micStream = null;
+    }
+    if (audioContext) {
+      var context = audioContext;
+      audioContext = null;
+      try { context.close().catch(function () {}); } catch (eContext) {}
+    }
+    analyser = null;
+    disposeCurrentPlayback();
+    callButton = null;
+    sessionVoiceKey = '';
     try {
       window.__alex_voice_session_active = false;
     } catch (eS0) {}
-    if (!skipSync) {
+    // Fire-and-forget: preserve the existing session sync after microphone cleanup.
+    if (wasRunning && !skipSync) {
       fetch(apiBase() + '/api/alex-voice-sync', {
         method: 'POST',
         headers: authHeadersJson(),
-        body: JSON.stringify({ voice_key: voiceKey(), duration_seconds: durationSec })
+        body: JSON.stringify({ voice_key: syncKey, duration_seconds: durationSec }),
+        keepalive: true
       })
         .then(function (r) {
           return r.json().then(function (d) {
@@ -1408,20 +1633,6 @@
       window.__voiceLastUserLine = '';
     } catch (eVu) {}
 
-    active = false;
-    processing = false;
-    if (limitTimer) { clearTimeout(limitTimer); limitTimer = null; }
-    clearNoSpeechNudgeTimer();
-    silenceNudgePending = false;
-    stopVAD();
-    if (mediaRecorder && mediaRecorder.state === 'recording') {
-      mediaRecorder.onstop = null;
-      mediaRecorder.stop();
-    }
-    mediaRecorder = null;
-    if (micStream) { micStream.getTracks().forEach(function (t) { t.stop(); }); micStream = null; }
-    if (audioContext) { audioContext.close().catch(function(){}); audioContext = null; analyser = null; }
-    disposeCurrentPlayback();
     try {
       window.__alex_mic_muted = false;
     } catch (eM2) {}
@@ -1436,11 +1647,24 @@
     if (tin) tin.value = '';
     var btn = document.getElementById('alex-btn');
     if (btn) { btn.textContent = 'GO LIVE WITH ALEX'; btn.classList.remove('live'); btn.disabled = false; }
-    if (window.__alex_overlay_mode) {
+    if (wasRunning && !keepOverlay && window.__alex_overlay_mode) {
       var bridge = document.getElementById('alex-voice-overlay-close-bridge');
       if (bridge) bridge.click();
     }
   }
 
   window.stopAlexVoiceSession = function () { stopAlex(false); };
+  window.__alexVoiceCleanup = function () {
+    stopAlex(false, true);
+    if (panelObserver) panelObserver.disconnect();
+    window.removeEventListener('pagehide', endVoiceOnNavigation);
+    window.removeEventListener('beforeunload', endVoiceOnNavigation);
+    document.removeEventListener('visibilitychange', handleVoiceVisibility);
+    voiceBindings.forEach(function (binding) {
+      binding.element.removeEventListener(binding.type, binding.handler);
+      delete binding.element._alexBound;
+      delete binding.element._alexMicBound;
+    });
+    voiceBindings = [];
+  };
 })();
