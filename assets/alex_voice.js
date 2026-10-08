@@ -505,6 +505,7 @@
     var h = { 'Content-Type': 'application/json' };
     var t = authToken();
     if (t) h['X-Auth-Token'] = t;
+    else if (window.ALEX_VOICE_KEY) h['X-Alex-Voice-Key'] = window.ALEX_VOICE_KEY;
     return h;
   }
 
@@ -512,6 +513,7 @@
     var h = { 'Content-Type': audioMime || 'audio/webm' };
     var t = authToken();
     if (t) h['X-Auth-Token'] = t;
+    else if (window.ALEX_VOICE_KEY) h['X-Alex-Voice-Key'] = window.ALEX_VOICE_KEY;
     return h;
   }
 
@@ -519,6 +521,7 @@
     var h = {};
     var t = authToken();
     if (t) h['X-Auth-Token'] = t;
+    else if (window.ALEX_VOICE_KEY) h['X-Alex-Voice-Key'] = window.ALEX_VOICE_KEY;
     return h;
   }
 

@@ -35,3 +35,16 @@ test('missing, invalid or inaccessible storage sends no authentication token', (
   }
   assert.equal(load('secret', true).authHeadersForGet()['X-Auth-Token'], undefined);
 });
+
+test('anonymous voice requests carry only the server-issued scoped capability', () => {
+  const client = load(null);
+  client.window.ALEX_VOICE_KEY = 'guest-voice-capability';
+  for (const headers of [client.authHeadersForGet(), client.authHeadersJson(), client.authHeadersForStt('audio/mp4')]) {
+    assert.equal(headers['X-Alex-Voice-Key'], 'guest-voice-capability');
+    assert.equal(headers['X-Auth-Token'], undefined);
+  }
+  const account = load('account-token');
+  account.window.ALEX_VOICE_KEY = 'guest-voice-capability';
+  assert.equal(account.authHeadersJson()['X-Auth-Token'], 'account-token');
+  assert.equal(account.authHeadersJson()['X-Alex-Voice-Key'], undefined);
+});

@@ -842,9 +842,19 @@ def _uid_from_auth_token(token: str) -> int:
 
 
 def _voice_request_uid(request: Request) -> int:
-    """Resolve logged-in user from Alex voice API requests (header or query)."""
+    """Account authentication, or a server-issued anonymous voice capability in demo mode."""
     tok = (request.headers.get("X-Auth-Token") or request.query_params.get("token") or "").strip()
-    return _uid_from_auth_token(tok)
+    if tok:
+        return _uid_from_auth_token(tok)
+    if not AI_CONFIG.demo:
+        return -1
+    key = (request.headers.get("X-Alex-Voice-Key") or "").strip()
+    ctx = _alex_voice_sessions.get(key) if _is_valid_voice_key(key) else None
+    if not ctx or not ctx.get("anonymous"):
+        return -1
+    if time.time() - float(ctx.get("_created", 0)) > VOICE_SESSION_MAX_AGE_SEC:
+        return -1
+    return int(ctx.get("uid", -1))
 
 
 def _notes_apply_unload_autosave(
@@ -5987,6 +5997,7 @@ class AppState(reflex_local_auth.LocalAuthState):
 
     # Voice chat (fullscreen overlay from composer mic — no separate /alex-live step)
     show_voice_overlay: bool = False
+    growth_mode: bool = False
 
     # Document upload state
     _document_data: bytes = b""
@@ -6942,8 +6953,13 @@ class AppState(reflex_local_auth.LocalAuthState):
         new_name = (self.settings_edit_name or "").strip()
         if not new_name:
             return
-        uid = self._cached_uid
+        uid = self._uid()
         if uid < 0:
+            if AI_CONFIG.demo:
+                self.name = _normalize_person_name(new_name)
+                self.settings_edit_name = self.name
+                self._save_memory(self._active_data_uid())
+                self.settings_name_saved = True
             return
         self.name = _normalize_person_name(new_name)
         self.settings_edit_name = self.name
@@ -6962,7 +6978,7 @@ class AppState(reflex_local_auth.LocalAuthState):
     def settings_change_password(self):
         self.settings_pw_error = ""
         self.settings_pw_success = False
-        uid = self._cached_uid
+        uid = self._uid()
         if uid < 0:
             self.settings_pw_error = "Not authenticated."
             return
@@ -7000,7 +7016,7 @@ class AppState(reflex_local_auth.LocalAuthState):
         confirm_text = (self.settings_delete_confirm or "").strip()
         if confirm_text != "DELETE":
             return
-        uid = self._cached_uid
+        uid = self._uid()
         if uid < 0:
             return
         with rx.session() as session:
@@ -7036,14 +7052,24 @@ class AppState(reflex_local_auth.LocalAuthState):
         ]
 
     def navigate_back_from_settings(self):
-        return rx.redirect(self._authenticated_landing_route())
+        return rx.redirect(self._workspace_home_route() if self._uid() < 0 else self._authenticated_landing_route())
 
     def on_load_settings(self):
         uid = self._uid()
-        if uid < 0:
-            return rx.redirect(auth_routes.LOGIN_ROUTE)
         self._cached_uid = uid
-        self._load_profile(uid)
+        if uid < 0:
+            if not AI_CONFIG.demo:
+                return rx.redirect(auth_routes.LOGIN_ROUTE)
+            guest_uid = self._active_data_uid()
+            self._load_guest_memory(guest_uid)
+            self._initialize_public_demo(guest_uid)
+            self.user_unique_id = ""
+            self.profile_created_at = ""
+            self.premium_activated_at = ""
+            self.is_pro = self.is_premium_1 = self.is_premium_2 = False
+            self.plan_tier = PLAN_FREE
+        else:
+            self._load_profile(uid)
         self.settings_tab = "general"
         self.settings_edit_name = self.name or ""
         self.settings_name_saved = False
@@ -8001,6 +8027,21 @@ class AppState(reflex_local_auth.LocalAuthState):
         if uid >= 0:
             return uid
         return self._guest_uid(create=True)
+
+    def _initialize_public_demo(self, uid: int) -> None:
+        """Initialize only this visitor's guest workspace, never an account profile."""
+        if not AI_CONFIG.demo or self._uid() >= 0 or self.is_started:
+            return
+        self.name = "Visitor"
+        self.degree = "Software Engineering"
+        self.pathway = ""
+        self.active_subject = ""
+        self.selected_year = "Year 1"
+        self.selected_semester = "Semester 1"
+        self.is_started = True
+        self.step = 6
+        self.memory_summary = "Anonymous exhibition session. No prior achievements or completed topics are known."
+        self._save_memory(uid)
 
     def _load_guest_memory(self, uid: int) -> None:
         if uid < 0:
@@ -12842,9 +12883,12 @@ Quality rules:
         except Exception:
             base_system = _ALEX_VOICE_SYSTEM
 
-        scope_summary = self._get_scope_summary(self._uid(), self.active_scope or "home")
+        voice_uid = self._active_data_uid()
+        scope_summary = self._get_scope_summary(voice_uid, self.active_scope or "home")
         memory_block = f"\n\n─── Student Semester Memory ───\n{scope_summary}" if scope_summary else ""
 
+        if self.growth_mode:
+            base_system += "\nYou are in growth overview mode. Discuss learning progress, completed topics, achievements, strengths and next steps using only the supplied student/session memory. If evidence is missing, say so; never invent progress."
         voice_system = (
             base_system
             + memory_block
@@ -12874,7 +12918,8 @@ Quality rules:
             "voice_system_base": voice_system,
             "history": api_history,
             "student_name": student_name,
-            "uid": self._uid(),
+            "uid": voice_uid,
+            "anonymous": self._uid() < 0,
             "session_id": int(self.current_session_id) if self.current_session_id else -1,
             "scope": self.active_scope or "",
             "voice_language": voice_language,
@@ -12882,7 +12927,7 @@ Quality rules:
             "_created": time.time(),
         }
 
-        if ALEX_VOICE_COMMERCIAL_GATES:
+        if ALEX_VOICE_COMMERCIAL_GATES and not AI_CONFIG.demo:
             is_premium = self.has_premium_access
             is_home = (self.active_scope or "home") == "home"
             voice_plan_tier = self.effective_plan_tier if is_premium else PLAN_FREE
@@ -12948,7 +12993,7 @@ Quality rules:
     @rx.event
     async def open_voice_chat(self):
         """Open voice UI over the chat workspace and start the session (mic prompt)."""
-        if self._uid() < 0:
+        if self._uid() < 0 and not AI_CONFIG.demo:
             yield rx.redirect(auth_routes.LOGIN_ROUTE)
             return
         boot = self._build_alex_voice_boot_script(auto_start_voice=True)
@@ -12987,6 +13032,8 @@ Quality rules:
                 self._load_guest_memory(uid)
         except Exception as e:
             print(f"[FREE] profile load error: {e}")
+        self._initialize_public_demo(uid)
+        self.growth_mode = str(self.router.page.params.get("growth", "")) == "1"
         if not self.is_started:
             yield rx.redirect(SELECTION_ROUTE)
             return
@@ -13047,11 +13094,15 @@ Quality rules:
     @rx.event
     async def on_load(self):
         uid = self._uid()
-        if uid < 0 and not self.is_hydrated:
-            return
         self._cached_uid = uid
         if uid < 0:
-            yield AppState.auth_redir()  # type: ignore
+            if AI_CONFIG.demo:
+                guest_uid = self._active_data_uid()
+                self._load_guest_memory(guest_uid)
+                self._initialize_public_demo(guest_uid)
+                yield rx.redirect(self._workspace_home_route())
+            else:
+                yield AppState.auth_redir()  # type: ignore
             return
         
         self._load_profile(uid)
@@ -13114,8 +13165,8 @@ Quality rules:
         # branch below redirects authed users to /select — exactly the
         # bug post-onboarding navigation kept hitting.
         real_uid = self._uid()
-        if real_uid < 0 and not self.is_hydrated:
-            return
+        # LocalStorage is synchronized before on_load; is_hydrated becomes true
+        # only after it completes, so an anonymous early return skips setup forever.
         self._cached_uid = real_uid
         uid = real_uid if real_uid >= 0 else self._active_data_uid()
 
@@ -13125,8 +13176,10 @@ Quality rules:
                 self._load_profile(real_uid)
             else:
                 self._load_guest_memory(uid)
+                self._initialize_public_demo(uid)
         except Exception as e:
             print(f"[ROUTE] profile load error: {e}")
+        self.growth_mode = str(self.router.page.params.get("growth", "")) == "1"
 
         if self.is_started and _degree_is_custom(self.degree):
             yield _replace_route("/free")
@@ -14498,15 +14551,17 @@ Course units to cover:\n{courses_text}"""
     async def go_home(self):
         uid = self._active_data_uid()
         if uid < 0: return
+        self.growth_mode = True
         if self.active_scope == "home" and self.view_mode == "home":
             self.show_semester_sidebar = False
+            yield rx.toast.info("Growth overview is ready. Ask about your learning progress.")
             return
         self.active_scope = "home"
         self.view_mode = "home"
         self.show_semester_sidebar = False
         self._save_memory(uid)
         self._switch_scope(uid, "home")
-        yield _hard_navigate(self._workspace_home_route())
+        yield _hard_navigate(self._workspace_home_route() + "?growth=1")
 
     @rx.event
     async def switch_to_home_chat(self, session_id: str):
@@ -16085,7 +16140,7 @@ Your response style rules:
             f"- cross_semester_scope_digest: {scopes_trunc or '(none)'}"
         )
 
-        if _degree_is_custom(self.degree):
+        if _degree_is_custom(self.degree) and not self.growth_mode:
             prompt = f"""You are Alex, a general academic assistant inside Alex AI.
 The student has not selected a specific degree program — they are using the open chat workspace.
 
@@ -16157,6 +16212,8 @@ Behavior rules:
 23. In your reply text to the user, never write subject letter codes (such as SENG) or numeric unit codes (such as 11213); use plain titles only, even if internal context contains codes.
 24. Never mention AI vendors, model names, internal routing, or system architecture."""
 
+        if self.growth_mode and self._uid() < 0:
+            prompt += "\nThis is an anonymous exhibition session. Discuss only the session context above. No prior completed topics, achievements, strengths or weaknesses may be invented. Clearly distinguish an illustrative study plan from actual progress."
         if _is_explicit_web_search_request(user_msg):
             prompt += """
 25. The user explicitly asked you to search the web. Answer with the found result directly.
@@ -16189,7 +16246,8 @@ Behavior rules:
         home_scope = self.active_scope or "home"
         chat_model, or_teaching_mode, route = await self._alex_resolve_chat_model(user_msg, uid)
         use_answer_cache_home = (
-            not visual_only_request
+            not self.growth_mode
+            and not visual_only_request
             and not route.get("manual_model_key")
             and not rich_teaching_request
             and not has_document_attached
@@ -25029,10 +25087,9 @@ def guest_auth_buttons() -> rx.Component:
             ),
             spacing="2",
             align="center",
-            position="fixed",
-            top=rx.breakpoints(initial="12px", md="18px"),
-            right=rx.breakpoints(initial="12px", md="22px"),
-            z_index="2000",
+            flex_shrink="0",
+            flex_wrap="wrap",
+            custom_attrs={"data-guest-header-actions": "true"},
             padding=rx.breakpoints(initial="4px", md="5px"),
             border_radius="999px",
             background="rgba(0,0,0,0.42)",
@@ -25091,6 +25148,7 @@ def home_page():
                 ),
                 rx.spacer(),
                 mobile_header_upgrade_button(),
+                guest_auth_buttons(),
                 app_tooltip(
                     rx.button(
                         rx.icon(tag="square_pen", size=20, color="rgba(255,255,255,0.7)"),
@@ -25116,6 +25174,7 @@ def home_page():
                 width="100%",
                 align="center",
                 padding="8px 12px",
+                    flex_wrap="wrap",
             ),
             display=rx.breakpoints(initial="block", md="none"),
             flex_shrink="0",
@@ -25130,7 +25189,7 @@ def home_page():
             rx.hstack(
                 rx.vstack(
                     rx.text(
-                        AppState.greeting_text,
+                        rx.cond(AppState.growth_mode, "Growth overview", AppState.greeting_text),
                         color="rgba(240,244,248,0.92)",
                         font_size="0.92rem",
                         font_weight="600",
@@ -25150,9 +25209,12 @@ def home_page():
                     spacing="0",
                     align_items="flex-start",
                 ),
+                rx.spacer(),
+                guest_auth_buttons(),
                 width="100%",
                 align="center",
                 padding="0.9em 2em 0.9em 1.4em",
+                flex_wrap="wrap",
             ),
             display=rx.breakpoints(initial="none", md="block"),
             flex_shrink="0",
@@ -27177,10 +27239,12 @@ def semester_page():
                     ),
                     rx.spacer(),
                     mobile_header_upgrade_button(),
+                    guest_auth_buttons(),
                     subject_switcher_trigger(),
                     width="100%",
                     align="center",
                     padding="10px 14px 6px 14px",
+                    flex_wrap="wrap",
                 ),
                 # ── Thin progress bar ──
                 rx.box(
@@ -27273,12 +27337,15 @@ def semester_page():
                             ),
                             rx.fragment(),
                         ),
+                        guest_auth_buttons(),
                         subject_switcher_trigger(),
                         spacing="3",
+                        flex_wrap="wrap",
                         align="center",
                     ),
                     width="100%",
                     padding="10px 1.5em 6px",
+                    flex_wrap="wrap",
                     flex_shrink="0",
                     align="center",
                 ),
@@ -31599,7 +31666,6 @@ def selection_page():
 def scope_page(route_scope: str = "home") -> rx.Component:
     page_scope = str(route_scope or "home").split(":", 1)[0]
     return rx.fragment(
-        guest_auth_buttons(),
         home_page() if page_scope == "home" else semester_page_with_search(),
     )
 
@@ -31825,7 +31891,7 @@ def settings_general_tab() -> rx.Component:
 
         # ── Change password (non-Google only) ──
         rx.cond(
-            ~AppState.is_google_user,
+            AppState.is_authenticated_now & ~AppState.is_google_user,
             rx.vstack(
                 rx.text("Password", color="white", font_size="1.15rem", font_weight="700"),
                 rx.text(
@@ -32127,6 +32193,7 @@ class _ProgressItem(rx.Base):
 
 
 class TrackerState(AppState):
+    _tracker_data_uid: int = -1
     # ── Multi-list management ──
     tracker_lists: list[_TrackerListMeta] = []
     current_tracker_id: int = -1
@@ -32264,7 +32331,7 @@ class TrackerState(AppState):
 
     # ── Internal helpers ──
     def _load_lists(self, session):
-        uid = self._cached_uid
+        uid = self._tracker_data_uid
         trackers = session.exec(
             select(TodoTracker).where(TodoTracker.user_id == uid)
         ).all()
@@ -32297,7 +32364,8 @@ class TrackerState(AppState):
     def on_load_tracker(self):
         real_uid = self._uid()
         uid = real_uid if real_uid >= 0 else self._active_data_uid()
-        self._cached_uid = uid
+        self._cached_uid = real_uid
+        self._tracker_data_uid = uid
         if real_uid < 0:
             self._load_guest_memory(uid)
         with rx.session() as session:
@@ -32313,7 +32381,7 @@ class TrackerState(AppState):
                 self._load_tracker_data(tracker)
 
     def _save(self):
-        uid = self._cached_uid
+        uid = self._tracker_data_uid
         if uid < 0 or self.current_tracker_id < 0:
             return
         with rx.session() as session:
@@ -32336,12 +32404,12 @@ class TrackerState(AppState):
     def switch_tracker(self, tracker_id: int):
         with rx.session() as session:
             tracker = session.get(TodoTracker, tracker_id)
-            if tracker and tracker.user_id == self._cached_uid:
+            if tracker and tracker.user_id == self._tracker_data_uid:
                 self._load_tracker_data(tracker)
         self.show_lists_panel = False
 
     def delete_tracker(self, tracker_id: int):
-        uid = self._cached_uid
+        uid = self._tracker_data_uid
         with rx.session() as session:
             tracker = session.get(TodoTracker, tracker_id)
             if tracker and tracker.user_id == uid:
@@ -32374,7 +32442,7 @@ class TrackerState(AppState):
         except (ValueError, TypeError):
             self.increase_days_id = -1
             return
-        uid = self._cached_uid
+        uid = self._tracker_data_uid
         with rx.session() as session:
             tracker = session.get(TodoTracker, tracker_id)
             if tracker and tracker.user_id == uid:
@@ -32430,7 +32498,7 @@ class TrackerState(AppState):
         days = self.create_days_value
         if days <= 0:
             return
-        uid = self._cached_uid
+        uid = self._tracker_data_uid
         if uid < 0:
             return
         with rx.session() as session:
@@ -33713,7 +33781,7 @@ class LearnState(AppState):
     def on_load_learn(self):
         real_uid = self._uid()
         uid = real_uid if real_uid >= 0 else self._active_data_uid()
-        self._cached_uid = uid
+        self._cached_uid = real_uid
         if real_uid >= 0:
             self._load_profile(real_uid)
         else:
@@ -36621,7 +36689,16 @@ def settings_page():
             settings_general_tab(),
             rx.cond(
                 AppState.settings_tab == "account",
-                settings_account_tab(),
+                rx.cond(
+                    AppState.is_authenticated_now,
+                    settings_account_tab(),
+                    rx.vstack(
+                        rx.text("Anonymous demo session", color="white", font_weight="600"),
+                        rx.text("Login to manage your personal account and subscription. Demo preferences belong only to this visitor session.", color="rgba(255,255,255,0.55)"),
+                        rx.link("Login", href=auth_routes.LOGIN_ROUTE, color="#34D399"),
+                        spacing="3",
+                    ),
+                ),
                 settings_learn_more_tab(),
             ),
         ),
@@ -36736,7 +36813,15 @@ def settings_page():
                     settings_general_tab(),
                     rx.cond(
                         AppState.settings_tab == "account",
-                        settings_account_tab(),
+                        rx.cond(
+                            AppState.is_authenticated_now,
+                            settings_account_tab(),
+                            rx.vstack(
+                                rx.text("Anonymous demo session", color="white", font_weight="600"),
+                                rx.text("Login to manage your personal account and subscription. Demo preferences belong only to this visitor session.", color="rgba(255,255,255,0.55)"),
+                                rx.link("Login", href=auth_routes.LOGIN_ROUTE, color="#34D399"), spacing="3",
+                            ),
+                        ),
                         settings_learn_more_tab(),
                     ),
                 ),
@@ -40097,6 +40182,7 @@ def free_sidebar_content() -> rx.Component:
         ),
 
         # ── NAV ITEMS ──
+        alex_workspace_button(),
         _nav_row("square_pen", "New chat", AppState.new_chat),
         _nav_row("search", "Search chats", AppState.toggle_global_search),
         _nav_row("notebook", "Notes", AppState.toggle_notes_panel),
@@ -40177,8 +40263,13 @@ def free_sidebar_content() -> rx.Component:
 def free_page():
     return rx.fragment(
         notes_panel(),
-        guest_auth_buttons(),
         rx.box(
+            rx.hstack(
+                rx.cond(AppState.growth_mode, rx.text("Growth overview", color="#E7B69D", font_weight="600"), rx.fragment()),
+                rx.spacer(), guest_auth_buttons(),
+                width="100%", padding="12px 22px",
+                display=rx.breakpoints(initial="none", md="flex"),
+            ),
             # ── Mobile header ──
             rx.box(
                 rx.hstack(
@@ -40204,6 +40295,7 @@ def free_page():
                     ),
                     rx.spacer(),
                     mobile_header_upgrade_button(),
+                    guest_auth_buttons(),
                     app_tooltip(
                         rx.button(
                             rx.icon(tag="square_pen", size=20, color="rgba(255,255,255,0.7)"),
@@ -40225,6 +40317,7 @@ def free_page():
                         "bottom",
                     ),
                     width="100%", align="center", padding="8px 12px",
+                    flex_wrap="wrap",
                 ),
                 display=rx.breakpoints(initial="block", md="none"),
                 flex_shrink="0",
