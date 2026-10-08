@@ -2,6 +2,7 @@ python-dotenv
 reflex==0.8.28.post1
 reflex-local-auth
 psycopg2-binary
+psycopg[binary]>=3.2
 sqlmodel
 fastapi
 uvicorn

@@ -27,7 +27,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN python -m pip install -r requirements.txt \
+    && python -c "import greenlet; import psycopg; import sqlalchemy.ext.asyncio; print('Build dependencies verified: greenlet', greenlet.__version__, 'psycopg', psycopg.__version__)"
 
 COPY . .
 
