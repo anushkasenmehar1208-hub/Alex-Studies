@@ -43,6 +43,10 @@
   var currentAudio = null;
   var browserUtterance = null;
   var browserSpeechTimer = null;
+  var bargeInInterval = null;
+  var BARGE_IN_RMS = 12;
+  var BARGE_IN_SUSTAIN_MS = 200;
+  var BARGE_IN_GUARD_MS = 250;
   /** When using Blob URLs for TTS playback (Safari often fails on long data:audio/wav;base64,...). */
   var currentAudioObjectUrl = null;
   var maxRecordTimeout = null;
@@ -113,6 +117,7 @@
 
   function pauseMicrophone() {
     clearListenTimer();
+    stopBargeInMonitor();
     abortCurrentListenSegment();
     setMicTracksEnabled(false);
   }
@@ -146,10 +151,12 @@
   var alexSseDone = false;
 
   function stopAlexPlaybackEngine() {
+    stopBargeInMonitor();
     playbackGeneration++;
     if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
     browserSpeechTimer = null;
     if (browserUtterance) {
+      browserUtterance.onstart = null;
       browserUtterance.onend = null;
       browserUtterance.onerror = null;
       browserUtterance = null;
@@ -244,16 +251,20 @@
   function speakBrowserReply(data, onDone) {
     if (!active) return;
     var generation = callGeneration;
+    var playback = playbackGeneration;
     pauseMicrophone();
     processing = true;
     var finished = false;
     function finish(error) {
       if (finished) return;
       finished = true;
-      if (!isCurrentCall(generation)) return;
+      if (!isCurrentCall(generation) || playback !== playbackGeneration) return;
+      stopBargeInMonitor();
+      setMicTracksEnabled(false);
       if (browserSpeechTimer) clearTimeout(browserSpeechTimer);
       browserSpeechTimer = null;
       if (browserUtterance) {
+        browserUtterance.onstart = null;
         browserUtterance.onend = null;
         browserUtterance.onerror = null;
       }
@@ -289,7 +300,11 @@
       browserSpeechTimer = setTimeout(function () {
         finish(true);
       }, 60000);
+      utterance.onstart = function () {
+        if (isCurrentCall(generation) && playback === playbackGeneration && browserUtterance === utterance) startBargeInMonitor();
+      };
       window.speechSynthesis.speak(utterance);
+      startBargeInMonitor();
     } catch (eSpeech) {
       finish(true);
     }
@@ -547,6 +562,8 @@
         setOrbState('idle');
         setStatus('Muted');
       }
+    } else if (!muted && active && browserUtterance) {
+      startBargeInMonitor();
     } else if (!muted && active && !processing) {
       startListening();
     }
@@ -1151,6 +1168,54 @@
     scheduleNoSpeechNudge();
 
     traceVoice('recorder-started', { mimeType: recorder.mimeType, speechDetected: false });
+  }
+
+  // During browser TTS, measure residual mic energy without creating a recorder.
+  // Echo cancellation is browser/device dependent: calibrate residual speaker energy
+  // at phrase onset, then require substantially louder sustained input.
+  function stopBargeInMonitor() {
+    if (bargeInInterval) clearInterval(bargeInInterval);
+    bargeInInterval = null;
+  }
+
+  function startBargeInMonitor() {
+    stopBargeInMonitor();
+    if (!active || micMuted() || !browserUtterance || !analyser) return;
+    setMicTracksEnabled(true);
+    var generation = callGeneration, playback = playbackGeneration;
+    var began = Date.now(), sustained = 0, echoFloor = 0;
+    var useFloat = typeof analyser.getFloatTimeDomainData === 'function';
+    var samples = useFloat ? new Float32Array(analyser.fftSize) : new Uint8Array(analyser.fftSize);
+    bargeInInterval = setInterval(function () {
+      if (!isCurrentCall(generation) || playback !== playbackGeneration || micMuted()) {
+        stopBargeInMonitor(); return;
+      }
+      if (useFloat) analyser.getFloatTimeDomainData(samples);
+      else analyser.getByteTimeDomainData(samples);
+      var sum = 0;
+      for (var i = 0; i < samples.length; i++) {
+        var value = useFloat ? samples[i] * 128 : samples[i] - 128;
+        sum += value * value;
+      }
+      var rms = Math.sqrt(sum / samples.length), now = Date.now();
+      if (now - began < BARGE_IN_GUARD_MS) {
+        echoFloor = Math.max(echoFloor, rms); sustained = 0; return;
+      }
+      var threshold = Math.max(BARGE_IN_RMS, echoFloor * 2.2);
+      if (rms < threshold) { sustained = 0; return; }
+      if (!sustained) sustained = now;
+      if (now - sustained < BARGE_IN_SUSTAIN_MS) return;
+      traceVoice('barge-in', { rms: Number(rms.toFixed(2)), threshold: Number(threshold.toFixed(2)) });
+      // Invalidate every old utterance/timer before cancel(), which may fire onerror.
+      disposeCurrentPlayback();
+      processing = false;
+      startListening();
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        speechDetected = true;
+        clearNoSpeechNudgeTimer();
+        setOrbState('user-speaking');
+      }
+    }, VAD_POLL_MS);
   }
 
   // ── Voice Activity Detection ────────────────────────────────

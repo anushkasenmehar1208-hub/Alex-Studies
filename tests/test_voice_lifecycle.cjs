@@ -190,7 +190,7 @@ test('two speech/STT/reply/browser-TTS turns work without touching controls, wit
     assert.equal(b.sttCalls().length, turn);
     assert.equal(b.spoken.length, turn);
     assert.equal(b.status(), 'Alex is speaking...');
-    assert.equal(b.streams[0].track.enabled, false);
+    assert.equal(b.streams[0].track.enabled, true);
     assert.ok(b.recorders.every(r => r.state === 'inactive'));
     b.spoken.at(-1).onend();
     await b.advance(249);
@@ -461,5 +461,57 @@ test('Safari float analyser and codec-qualified MP4 produce a valid STT upload',
   assert.equal(b.sttCalls().length, 1);
   assert.equal(b.sttCalls()[0].init.body.type, 'audio/mp4;codecs=mp4a.40.2');
   assert.equal(b.window.getAlexVoiceDiagnostics().sttStatus, 200);
+  b.window.stopAlexVoiceSession();
+});
+
+
+test('barge-in cancels TTS once, captures the interruption and delivers the next reply', async () => {
+  const b = browser(); await b.start();
+  b.energy(35); await b.advance(300); b.energy(0); await b.advance(450);
+  const oldEnd = b.spoken[0].onend, oldError = b.spoken[0].onerror;
+  const before = b.recorders.length, cancels = b.cancelled();
+  await b.advance(300);
+  b.energy(35); await b.advance(225);
+  assert.equal(b.cancelled(), cancels + 1);
+  assert.equal(b.spoken[0].onend, null);
+  assert.equal(b.recorders.length, before + 1);
+  assert.equal(b.status(), 'Listening…');
+  oldEnd(); oldError(); await flush();
+  assert.equal(b.recorders.length, before + 1);
+  assert.equal(b.recorders.filter(r => r.state === 'recording').length, 1);
+  b.energy(0); await b.advance(475);
+  assert.equal(b.sttCalls().length, 2);
+  assert.equal(b.spoken.length, 2);
+  assert.equal(b.status(), 'Alex is speaking...');
+  b.window.stopAlexVoiceSession(); await b.advance(2000);
+  assert.equal(b.timers.size, 0);
+  assert.equal(b.streams[0].track.readyState, 'ended');
+});
+
+test('speaker residual and brief loud noise do not interrupt; normal completion resumes once', async () => {
+  const b = browser(); await b.start();
+  b.energy(35); await b.advance(300); b.energy(0); await b.advance(450);
+  const cancels = b.cancelled(), count = b.recorders.length;
+  b.energy(14); await b.advance(1000); // initial echo calibration makes threshold > 14
+  b.energy(40); await b.advance(100); b.energy(14); await b.advance(500);
+  assert.equal(b.cancelled(), cancels);
+  assert.equal(b.recorders.length, count);
+  assert.equal(b.sttCalls().length, 1);
+  b.energy(0); b.spoken[0].onend(); await b.advance(250);
+  assert.equal(b.recorders.length, count + 1);
+  b.window.stopAlexVoiceSession();
+});
+
+test('manual mute disables interruption monitoring and unmute restores it during TTS', async () => {
+  const b = browser(); await b.start();
+  b.energy(35); await b.advance(300); b.energy(0); await b.advance(450);
+  const cancels = b.cancelled();
+  b.elements['alex-mic-toggle'].emit('click');
+  b.energy(60); await b.advance(1000);
+  assert.equal(b.cancelled(), cancels);
+  assert.equal(b.streams[0].track.enabled, false);
+  b.energy(0); b.elements['alex-mic-toggle'].emit('click'); await b.advance(300);
+  b.energy(35); await b.advance(225);
+  assert.equal(b.cancelled(), cancels + 1);
   b.window.stopAlexVoiceSession();
 });
