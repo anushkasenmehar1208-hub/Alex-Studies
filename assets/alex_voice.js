@@ -803,6 +803,7 @@
   function voiceErrorMessage(status, code, isStt) {
     if (status === 429 || code === 'rate_limit') return 'Alex is getting a lot of requests right now. Try again in a moment.';
     if (status === 408 || status === 504 || code === 'timeout' || code === 'network') return 'Alex took too long to respond. Please try again.';
+    if (code === 'unavailable' || status === 503) return 'Alex is temporarily unavailable. Please try again.';
     if (isStt || code === 'stt') return 'I couldn’t clearly hear that. Please try again.';
     return 'Alex is temporarily unavailable. Please try again.';
   }

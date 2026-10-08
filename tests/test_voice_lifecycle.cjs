@@ -404,3 +404,21 @@ test('SSE rate-limit error is a retry notice, never spoken or stored as an Alex 
   assert.equal(b.elements['alex-transcript'].children.at(-1).textContent, 'Alex is getting a lot of requests right now. Try again in a moment.');
   b.window.stopAlexVoiceSession();
 });
+
+for (const [status, code, expected] of [
+  [429, 'rate_limit', 'Alex is getting a lot of requests right now. Try again in a moment.'],
+  [504, 'timeout', 'Alex took too long to respond. Please try again.'],
+  [422, 'stt', 'I couldn’t clearly hear that. Please try again.'],
+  [503, 'unavailable', 'Alex is temporarily unavailable. Please try again.'],
+]) {
+  test(`STT error ${status} shows a safe retry message and appends no transcript`, async () => {
+    const stt = deferred(), b = browser({stt}); await b.start();
+    b.energy(35); await b.advance(300); b.energy(0); await b.advance(450);
+    stt.resolve(new Response(JSON.stringify({error: 'private provider error', error_code: code, text: 'bad transcript'}), {status}));
+    await flush();
+    assert.equal(b.elements['alex-chat-panel'].children.length, 0);
+    assert.equal(b.status(), expected);
+    assert.equal(b.elements['alex-transcript'].textContent, expected);
+    b.window.stopAlexVoiceSession();
+  });
+}
