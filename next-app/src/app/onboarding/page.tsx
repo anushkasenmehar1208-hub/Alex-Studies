@@ -3,6 +3,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Check, ChevronDown } from "lucide-react";
+import { decideOnboardingEntry, decideOnboardingFinish, type EntryMemory } from "@/lib/onboarding-routing";
 import { readBrowserToken } from "@/lib/browser-storage";
 
 type Country = {
@@ -344,6 +345,36 @@ function PathwayDropdown({
   );
 }
 
+// Any account credential on this device (localStorage token or the
+// non-HttpOnly auth cookie). Without one the visitor is a guest.
+function hasStoredAuth(): boolean {
+  if (readBrowserToken("_auth_token")) return true;
+  try {
+    if (
+      typeof document !== "undefined" &&
+      document.cookie
+        .split(";")
+        .some((part) => part.trim().startsWith("_auth_token="))
+    ) {
+      return true;
+    }
+  } catch {
+    // Cookie access can be denied; treat as guest.
+  }
+  return false;
+}
+
+// Reuse the existing Reflex guest identity. Never use an account id here.
+function guestHeaders(): Record<string, string> {
+  let token = readBrowserToken("alex_guest_token");
+  if (!/^g_[A-Za-z0-9_-]{32,64}$/.test(token)) {
+    const bytes = crypto.getRandomValues(new Uint8Array(24));
+    token = "g_" + Array.from(bytes, n => n.toString(16).padStart(2, "0")).join("");
+    window.localStorage.setItem("alex_guest_token", token);
+  }
+  return { "X-Alex-Guest-Token": token };
+}
+
 export default function OnboardingPage() {
   const [country, setCountry] = useState("");
   const [degree, setDegree] = useState("");
@@ -362,19 +393,26 @@ export default function OnboardingPage() {
     const token = readBrowserToken("_auth_token");
     const headers: Record<string, string> = {};
     if (token) headers["Authorization"] = `Bearer ${token}`;
-    fetch("/api/onboarding/status", { headers })
-      .then((r) => {
-        if (r.status === 401) {
-          window.location.href = "/login";
-          return null;
+    const authenticated = hasStoredAuth();
+    if (!authenticated) Object.assign(headers, guestHeaders());
+    fetch(authenticated ? "/api/onboarding/status" : "/api/onboarding/guest", { headers })
+      .then(async (r) => {
+        let memory: EntryMemory = null;
+        if (r.ok) {
+          const data = await r.json().catch(() => null);
+          memory = data?.memory ?? null;
         }
-        if (!r.ok) throw new Error("Could not load your study plan.");
-        return r.json();
-      })
-      .then((data) => {
-        const m = data?.memory;
-        if (m && m.is_started && m.degree && m.selected_year && m.selected_semester) {
-          window.location.href = "/app";
+        const entry = decideOnboardingEntry({
+          status: r.status,
+          hasAuth: hasStoredAuth(),
+          memory,
+        });
+        if (entry.action === "login") {
+          window.location.href = "/login";
+          return;
+        }
+        if (entry.action === "app") {
+          window.location.href = entry.to;
           return;
         }
         setCheckingStatus(false);
@@ -383,7 +421,7 @@ export default function OnboardingPage() {
   }, []);
 
   const visibleDegrees = useMemo(
-    () => degrees.filter((item) => item.countries.includes(country)),
+    () => degrees.filter((item) => !country || item.countries.includes(country)),
     [country],
   );
   const pathwayOptions = PATHWAYS_BY_DEGREE[degree];
@@ -393,9 +431,11 @@ export default function OnboardingPage() {
 
   function chooseCountry(nextCountry: string) {
     setCountry(nextCountry);
-    setDegree("");
-    setPathway("");
-    setSemester("");
+    if (!degrees.find(item => item.code === degree)?.countries.includes(nextCountry)) {
+      setDegree("");
+      setPathway("");
+      setSemester("");
+    }
     setSemesterOpen(false);
     setPathwayOpen(false);
   }
@@ -427,12 +467,19 @@ export default function OnboardingPage() {
         "Content-Type": "application/json",
       };
       if (token) headers["Authorization"] = `Bearer ${token}`;
-      const response = await fetch("/api/onboarding/complete", {
+      const authenticated = hasStoredAuth();
+      if (!authenticated) Object.assign(headers, guestHeaders());
+      const response = await fetch(authenticated ? "/api/onboarding/complete" : "/api/onboarding/guest", {
         method: "POST",
         headers,
         body: JSON.stringify({ country, degree, pathway: pathway || null, semester }),
       });
-      if (!response.ok) {
+      const outcome = decideOnboardingFinish({
+        status: response.status,
+        hasAuth: hasStoredAuth(),
+        scope: semester,
+      });
+      if (outcome.action !== "continue") {
         const data = await response.json().catch(() => null);
         throw new Error(data?.error || "Could not save your study plan. Please try again.");
       }
@@ -442,7 +489,7 @@ export default function OnboardingPage() {
       // onboarding form on /app). We include the scope in the URL
       // because Safari Private doesn't reliably set our auth cookie,
       // so the middleware can't look it up via the status endpoint.
-      window.location.href = `/app?onboarded=1&scope=${encodeURIComponent(semester)}`;
+      window.location.href = outcome.to;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save your study plan. Please try again.");
     } finally {
@@ -528,25 +575,11 @@ export default function OnboardingPage() {
           </div>
 
           <div className="space-y-3.5">
-            <Section
-              title="Where do you study?"
-            >
-              <div className="grid grid-cols-2 gap-3">
-                {countries.map((item) => (
-                  <OptionCard
-                    key={item.code}
-                    title={item.name}
-                    prefix={item.flag}
-                    selected={country === item.code}
-                    onClick={() => chooseCountry(item.code)}
-                  />
-                ))}
-              </div>
-            </Section>
+
 
             {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
             <AnimatePresence initial={false}>
-              {country && (
+              {(
                 <Section
                   key="degree"
                   title="What are you studying?"
@@ -591,6 +624,24 @@ export default function OnboardingPage() {
                     onSelect={setSemester}
                   />
                 </Section>
+              )}
+
+              {degree && pathwayReady && semester && (
+            <Section
+              title="Where do you study?"
+            >
+              <div className="grid grid-cols-2 gap-3">
+                {countries.filter(item => degrees.find(d => d.code === degree)?.countries.includes(item.code)).map((item) => (
+                  <OptionCard
+                    key={item.code}
+                    title={item.name}
+                    prefix={item.flag}
+                    selected={country === item.code}
+                    onClick={() => chooseCountry(item.code)}
+                  />
+                ))}
+              </div>
+            </Section>
               )}
 
               {(canFinish || loading) && (
