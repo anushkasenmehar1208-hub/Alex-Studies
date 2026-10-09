@@ -33672,6 +33672,23 @@ class LearnQuizQuestion(TypedDict):
     picked: int      # -1 if not picked yet, else 0..3
 
 
+# Explicit server policy: this unlock never applies outside free Groq demo mode.
+LEARN_DEMO_ACCESS = AI_CONFIG.demo and os.getenv("ALEX_LEARN_DEMO_ACCESS", "true").strip().lower() in ("true", "1", "yes")
+
+
+def _learn_generation_limit(uid: int) -> str:
+    """Bound combined Guide/Quiz requests using the existing single-server limiter."""
+    if not LEARN_DEMO_ACCESS:
+        return ""
+    for key, count, seconds in ((f"learn-demo-cooldown:{uid}", 1, 10),
+                                (f"learn-demo:{uid}", 6, 3600),
+                                ("learn-demo-global", 60, 3600)):
+        if not _rl.is_allowed(key, count, seconds):
+            wait = _rl.seconds_until_reset(key, seconds)
+            return f"Demo learning limit reached. Please try again in {max(1, wait)} seconds."
+    return ""
+
+
 class LearnState(AppState):
     """State for the /learn page — paste a YouTube URL, get an AI-powered study session."""
 
@@ -33721,6 +33738,10 @@ class LearnState(AppState):
 
     # ── Rate-limit feedback ───────────────────────────────────
     rate_limit_msg: str = ""      # Non-empty → show banner
+
+    @rx.var
+    def has_learning_access(self) -> bool:
+        return LEARN_DEMO_ACCESS or self.has_premium_access
 
     @rx.var
     def has_video(self) -> bool:
@@ -33786,7 +33807,7 @@ class LearnState(AppState):
             self._load_profile(real_uid)
         else:
             self._load_guest_memory(uid)
-        if not self.is_started:
+        if not self.is_started and not LEARN_DEMO_ACCESS:
             return rx.redirect(SELECTION_ROUTE)
         if _degree_is_custom(self.degree):
             self.active_scope = "home"
@@ -33857,7 +33878,7 @@ class LearnState(AppState):
         try:
             with rx.session() as session:
                 row = session.get(LearnVideoSession, sid)
-                if row:
+                if row and row.user_id == self._active_data_uid() and row.video_id == self.video_id:
                     row.transcript_cached = self.transcript or ""
                     session.add(row)
                     session.commit()
@@ -33986,7 +34007,7 @@ class LearnState(AppState):
                 try:
                     with rx.session() as session:
                         row = session.get(LearnVideoSession, current_sid)
-                        if row:
+                        if row and row.user_id == uid and row.video_id == current_vid:
                             row.transcript_cached = fetched
                             session.add(row)
                             session.commit()
@@ -34002,7 +34023,7 @@ class LearnState(AppState):
         try:
             with rx.session() as session:
                 row = session.get(LearnVideoSession, sid)
-                if row is None:
+                if row is None or row.user_id != self._active_data_uid() or row.video_id != self.video_id:
                     return
                 if chat:
                     row.chat_history_json = json.dumps(self.chat_messages or [])
@@ -34082,13 +34103,17 @@ class LearnState(AppState):
         async with self:
             if self.summary_loading or not self.video_id:
                 return
-            if not self.has_premium_access:
+            if not self.has_learning_access:
                 self.active_tab = "summary"
                 return
-            if not self.transcript:
+            if not self.has_transcript:
                 self.summary = "No transcript available — can't summarize this video."
                 return
             uid = self._active_data_uid()
+            limit = _learn_generation_limit(uid)
+            if limit:
+                self.rate_limit_msg = limit
+                return
             # 5 summaries per hour per user
             if not _rl.is_allowed(f"summary:{uid}", 5, 3600):
                 wait = _rl.seconds_until_reset(f"summary:{uid}", 3600)
@@ -34097,6 +34122,7 @@ class LearnState(AppState):
             self.rate_limit_msg = ""
             self.summary_loading = True
             transcript = self.transcript
+            video_id, session_id = self.video_id, self.session_id
 
         system = (
             "You are creating a comprehensive study guide for a YouTube video, "
@@ -34112,14 +34138,19 @@ class LearnState(AppState):
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
         try:
-            resp = await asyncio.to_thread(_openrouter_complete, OPENROUTER_TEACHER_MODEL, messages, 1800, 0.4)
+            resp = await asyncio.to_thread(_openrouter_complete, OPENROUTER_TEACHER_MODEL, messages, 2048, 0.4, raise_errors=AI_CONFIG.uses_groq)
             text = (resp.text or "").strip() or "Couldn't generate a summary right now."
-        except Exception as e:
-            text = f"Couldn't reach the AI: {e}"
+        except Exception:
+            async with self:
+                self.summary_loading = False
+                self.rate_limit_msg = "Alex could not generate the guide. Please try again in a moment."
+            return
 
         async with self:
-            self.summary = text
             self.summary_loading = False
+            if self.video_id != video_id or self.session_id != session_id:
+                return
+            self.summary = text
             self._persist_session(summary=True)
 
     # ── AI: generate a 5-question multiple-choice quiz ──────
@@ -34128,13 +34159,17 @@ class LearnState(AppState):
         async with self:
             if self.quiz_loading or not self.video_id:
                 return
-            if not self.has_premium_access:
+            if not self.has_learning_access:
                 self.active_tab = "quiz"
                 return
-            if not self.transcript:
+            if not self.has_transcript:
                 self.quiz_questions = []
                 return
             uid = self._active_data_uid()
+            limit = _learn_generation_limit(uid)
+            if limit:
+                self.rate_limit_msg = limit
+                return
             # 10 quiz generations per hour per user
             if not _rl.is_allowed(f"quiz:{uid}", 10, 3600):
                 wait = _rl.seconds_until_reset(f"quiz:{uid}", 3600)
@@ -34144,6 +34179,7 @@ class LearnState(AppState):
             self.quiz_loading = True
             self.quiz_revealed = False
             transcript = self.transcript
+            video_id, session_id = self.video_id, self.session_id
 
         system = (
             "You are creating a 5-question multiple-choice quiz to test understanding "
@@ -34167,7 +34203,7 @@ class LearnState(AppState):
 
         questions: list[dict] = []
         try:
-            resp = await asyncio.to_thread(_openrouter_complete, OPENROUTER_TEACHER_MODEL, messages, 1500, 0.3)
+            resp = await asyncio.to_thread(_openrouter_complete, OPENROUTER_TEACHER_MODEL, messages, 2048, 0.3, raise_errors=AI_CONFIG.uses_groq)
             raw = (resp.text or "").strip()
             # Extract JSON object even if wrapped in fences/commentary
             m = re.search(r"\{[\s\S]*\}", raw)
@@ -34183,8 +34219,8 @@ class LearnState(AppState):
                         if not isinstance(choices, list) or len(choices) != 4:
                             continue
                         ans = int(q.get("answer", 0))
-                        if ans < 0 or ans > 3:
-                            ans = 0
+                        if not text_q or any(not str(c).strip() for c in choices) or ans < 0 or ans > 3:
+                            continue
                         questions.append({
                             "q": text_q,
                             "choices": [str(c) for c in choices],
@@ -34192,17 +34228,25 @@ class LearnState(AppState):
                             "explain": str(q.get("explain", "")).strip(),
                             "picked": -1,
                         })
-        except Exception as e:
-            logger.warning(f"quiz parse error: {e}")
+            if len(questions) != 5:
+                raise ValueError("invalid_quiz")
+        except Exception:
+            logger.warning("Learn quiz generation failed: provider failure or invalid question format")
+            async with self:
+                self.quiz_loading = False
+                self.rate_limit_msg = "Alex could not generate the quiz. Please try again in a moment."
+            return
 
         async with self:
-            self.quiz_questions = questions
             self.quiz_loading = False
+            if self.video_id != video_id or self.session_id != session_id:
+                return
+            self.quiz_questions = questions
             self._persist_session(quiz=True)
 
     def quiz_pick(self, q_index: int, choice_index: int):
         """User picks an answer for question q_index."""
-        if q_index < 0 or q_index >= len(self.quiz_questions):
+        if q_index < 0 or q_index >= len(self.quiz_questions) or choice_index not in range(4):
             return
         new_qs = list(self.quiz_questions)
         q = dict(new_qs[q_index])
@@ -35107,7 +35151,7 @@ def _learn_premium_locked_panel(title: str, description: str, icon: str, gradien
 
 def _learn_paid_panel(content: rx.Component, title: str, description: str, icon: str, gradient: str) -> rx.Component:
     return rx.cond(
-        LearnState.has_premium_access,
+        LearnState.has_learning_access,
         content,
         _learn_premium_locked_panel(title, description, icon, gradient),
     )
@@ -35573,7 +35617,7 @@ def _learn_tab_button(value: str, label: str, icon: str) -> rx.Component:
             *(
                 [
                     rx.cond(
-                        ~LearnState.has_premium_access,
+                        ~LearnState.has_learning_access,
                         rx.icon(tag="lock", size=11, color="rgba(251,191,36,0.82)"),
                         rx.fragment(),
                     )
@@ -35591,7 +35635,7 @@ def _learn_tab_button(value: str, label: str, icon: str) -> rx.Component:
         variant="ghost",
         custom_attrs={
             "aria-label": f"{label} tab",
-            "title": f"Premium: {label}" if is_premium_feature else label,
+            "title": rx.cond(LearnState.has_learning_access, label, f"Premium: {label}") if is_premium_feature else label,
         },
         style={
             "background": rx.cond(is_active, "rgba(244,63,94,0.16)", "transparent"),
