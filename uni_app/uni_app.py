@@ -4899,13 +4899,17 @@ BS_PATHWAY_LABELS: list[str] = ["-".join(p) for p in BS_PATHWAYS]
 
 
 def pathway_subject_codes(pathway_label: str) -> list[str]:
-    """Subject codes from a stored pathway string ('A / B / C' or 'A-B-C' from handbook)."""
+    """Resolve stored subject codes or display names, keeping their pathway order."""
     p = (pathway_label or "").strip()
     if not p:
         return []
-    if "/" in p:
-        return [s.strip() for s in p.split("/") if s.strip()]
-    return [s.strip() for s in p.split("-") if s.strip()]
+    # Next.js stores display names; legacy Reflex records already contain codes.
+    # Resolve only known subjects so saved pathways select existing curriculum keys.
+    names = {**PS_SUBJECT_FULL_NAMES, **BS_SUBJECT_FULL_NAMES}
+    aliases = {name.casefold(): code for code, name in names.items()}
+    aliases.update({code.casefold(): code for code in names})
+    parts = [part.strip() for part in p.split("/" if "/" in p else "-") if part.strip()]
+    return [aliases.get(part.casefold(), part) for part in parts]
 
 DEGREE_SUBJECT_FULL_NAMES: dict[str, dict[str, str]] = {
     "Physical Science": PS_SUBJECT_FULL_NAMES,
